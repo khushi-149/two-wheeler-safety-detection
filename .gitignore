@@ -1,4 +1,3 @@
-
 # Python
 __pycache__/
 *.py[cod]
@@ -9,15 +8,24 @@ venv/
 data/helmet_dataset/
 
 # YOLO training outputs
-runs/
+/runs/*
+!/runs/README.md
 
 # Evaluation archive
 eval/helmet_evaluation.zip
 
-# Keep model weights locally (large files)
+# Keep model weights locally
 *.pt
 
+# Keep traffic videos locally
 data/videos/*.mp4
 
-# Generated detection outputs
-outputs/
+# Generated outputs: keep folder placeholders only
+/outputs/*
+!/outputs/README.md
+!/outputs/evidence/
+/outputs/evidence/*
+!/outputs/evidence/README.md
+!/outputs/videos/
+/outputs/videos/*
+!/outputs/videos/README.md
