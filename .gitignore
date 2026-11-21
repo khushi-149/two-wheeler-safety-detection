@@ -1,0 +1,20 @@
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.env
+
+# Dataset
+data/helmet_dataset/
+
+# YOLO training outputs
+runs/
+
+# Evaluation archive
+eval/helmet_evaluation.zip
+
+# Keep model weights locally (large files)
+*.pt
+
+data/videos/*.mp4
