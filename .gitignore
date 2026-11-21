@@ -29,3 +29,15 @@ data/videos/*.mp4
 !/outputs/videos/
 /outputs/videos/*
 !/outputs/videos/README.md
+
+# Local test images
+/data/test_images/
+
+# Extra generated test screenshots
+/screenshots/rider_count_test.jpg
+/screenshots/triple_1_annotated.jpg
+/screenshots/triple_5_annotated.jpg
+/screenshots/violation_*.jpg
+
+# Local backup file
+/src/detect_video_backup.py
