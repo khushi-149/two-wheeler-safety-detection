@@ -22,9 +22,10 @@ It aims to help identify unsafe riding behaviour and improve awareness of road s
 - Python
 - OpenCV
 - Ultralytics YOLO
-- YOLO11n
+- YOLO11m (vehicle detection in the main application)
+- YOLO11n (vehicle detection in the separate video script)
 - YOLO11n-Pose
-- Custom-trained YOLO helmet detection model
+- Custom-trained YOLO11n helmet detection model
 - Visual Studio Code
 
 ## Main Features
@@ -124,8 +125,8 @@ The photo and video tests produced correct results in the tested cases, based on
 ### 1. Clone the repository
 
 ```bash
-git clone YOUR_GITHUB_REPOSITORY_URL
-cd two-wheeler-safety
+git clone https://github.com/khushi-149/two-wheeler-safety-detection.git
+cd two-wheeler-safety-detection
 ```
 
 ### 2. Create a virtual environment
@@ -167,7 +168,6 @@ Select Photo Testing or Video Testing from the main menu.
 - Add object tracking across video frames.
 - Improve helmet detection in crowded scenes.
 - Develop a real-time camera-based monitoring interface.
-- Build a dashboard for detection statistics and reports.
 
 ## Conclusion
 

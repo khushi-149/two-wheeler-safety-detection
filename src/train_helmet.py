@@ -9,10 +9,11 @@ model.train(
     data="data/helmet_dataset/data.yaml",
     epochs=30,
     imgsz=640,
-    batch=8,
+    batch=16,
     workers=0,
     project="runs/helmet",
     name="helmet_detector"
 )
 
 print("Helmet model training completed!")
+
