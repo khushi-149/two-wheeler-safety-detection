@@ -4,3 +4,5 @@ pyyaml
 pandas
 numpy
 streamlit
+supervision>=0.32.0
+easyocr>=1.7.2
