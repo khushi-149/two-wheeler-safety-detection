@@ -16,6 +16,7 @@ import time
 from datetime import datetime
 
 import cv2
+import numpy as np
 from ultralytics import YOLO
 
 from rider_association import (
@@ -55,6 +56,22 @@ NO_HELMET_CLASS = 1    # "without helmet"
 # 1 = analyse every bike every frame (slowest, most exact).
 ANALYZE_EVERY = 3
 CACHE_MAX_AGE = 90   # forget a bike's cached analysis after this many frames unseen
+
+# Rider counts are smoothed: the reported count is the (lower) median of the
+# last COUNT_HISTORY analyses, and a count of 3+ is only reported once at
+# least MIN_HISTORY_FOR_TRIPLE analyses agree. Single-frame glitches can no
+# longer raise a triple-riding violation.
+COUNT_HISTORY = 5
+MIN_HISTORY_FOR_TRIPLE = 3
+
+# A person rides a bike when their SEAT (hip point) is inside the bike box,
+# widened by these fractions of the box size.
+SEAT_MARGIN_SIDE = 0.10
+SEAT_MARGIN_TOP = 0.15
+SEAT_MARGIN_BOTTOM = 0.10
+
+# Person boxes from overlapping crops with at least this IoU are the same person.
+PERSON_DUP_IOU = 0.75
 
 # Input size for the per-bike crops. Crops are small, so a small size is
 # much faster than the default 640 with little accuracy loss.
@@ -223,11 +240,58 @@ def dedupe_detections(dets, iou_threshold=0.5):
     return kept
 
 
+def hip_from_keypoints(keypoints, confidences):
+    """Mid-point of the detected hips (COCO keypoints 11 and 12), or None."""
+    points = []
+
+    for idx in (11, 12):
+        if idx >= len(keypoints):
+            continue
+
+        x, y = keypoints[idx][0], keypoints[idx][1]
+        conf = confidences[idx] if confidences is not None else 1.0
+
+        if conf >= 0.30 and (x or y):
+            points.append((x, y))
+
+    if not points:
+        return None
+
+    return (sum(p[0] for p in points) / len(points),
+            sum(p[1] for p in points) / len(points))
+
+
+def person_seat_point(person):
+    """Where the person sits: the hips if known, else 60% down their body box."""
+    hip = person.get("hip")
+
+    if hip is not None:
+        return hip
+
+    x1, y1, x2, y2 = person["box"]
+    return ((x1 + x2) / 2.0, y1 + 0.6 * (y2 - y1))
+
+
+def smoothed_count(history):
+    """Lower median of recent rider counts; 3+ needs enough agreeing checks."""
+    ordered = sorted(history)
+    value = ordered[(len(ordered) - 1) // 2]
+
+    if value >= 3 and len(history) < MIN_HISTORY_FOR_TRIPLE:
+        value = 2
+
+    return value
+
+
 def assign_people_to_bikes(people, motorcycles):
     """
-    Count riders per motorcycle index. A person belongs to the bike whose
-    box overlaps most of their body, if their centre is horizontally
-    within that bike.
+    Count riders per motorcycle index.
+
+    A person rides the bike their SEAT point (hips) is inside. If the seat is
+    inside several bike boxes (bikes side by side) the bike whose centre is
+    horizontally closest wins, so a neighbour's rider is not credited to a
+    big bike next to it. Only if the seat is inside no bike box do we fall
+    back to the bike whose box overlaps most of the person's body.
 
     Returns (counts, rider_boxes, other_boxes):
       counts       {bike index: number of riders}
@@ -239,28 +303,52 @@ def assign_people_to_bikes(people, motorcycles):
     other_boxes = []
 
     for person in people:
-        px1, py1, px2, py2 = person["box"]
-        pcx = (px1 + px2) / 2.0
-        parea = max(1.0, (px2 - px1) * (py2 - py1))
 
-        best, best_score = None, 0.0
+        sx, sy = person_seat_point(person)
+
+        best, best_dist = None, float("inf")
 
         for idx, moto in enumerate(motorcycles):
             bx1, by1, bx2, by2 = moto["box"]
-            bw = bx2 - bx1
+            bw, bh = bx2 - bx1, by2 - by1
 
-            if not (bx1 - 0.15 * bw <= pcx <= bx2 + 0.15 * bw):
+            inside = (
+                bx1 - SEAT_MARGIN_SIDE * bw <= sx <= bx2 + SEAT_MARGIN_SIDE * bw
+                and by1 - SEAT_MARGIN_TOP * bh <= sy <= by2 + SEAT_MARGIN_BOTTOM * bh
+            )
+
+            if not inside:
                 continue
 
-            ix1, iy1 = max(px1, bx1), max(py1, by1)
-            ix2, iy2 = min(px2, bx2), min(py2, by2)
-            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
-            score = inter / parea
+            dist = abs(sx - (bx1 + bx2) / 2.0) / max(bw, 1.0)
 
-            if score > best_score:
-                best, best_score = idx, score
+            if dist < best_dist:
+                best, best_dist = idx, dist
 
-        if best is not None and best_score >= MIN_RIDER_OVERLAP:
+        # Fallback: seat inside no bike -> most body overlap
+        if best is None:
+            px1, py1, px2, py2 = person["box"]
+            parea = max(1.0, (px2 - px1) * (py2 - py1))
+            best_score = 0.0
+
+            for idx, moto in enumerate(motorcycles):
+                bx1, by1, bx2, by2 = moto["box"]
+                bw = bx2 - bx1
+
+                if not (bx1 - 0.15 * bw <= (px1 + px2) / 2.0 <= bx2 + 0.15 * bw):
+                    continue
+
+                ix1, iy1 = max(px1, bx1), max(py1, by1)
+                ix2, iy2 = min(px2, bx2), min(py2, by2)
+                score = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1) / parea
+
+                if score > best_score:
+                    best, best_score = idx, score
+
+            if best_score < MIN_RIDER_OVERLAP:
+                best = None
+
+        if best is not None:
             counts[best] += 1
             rider_boxes[best].append(person["box"])
         else:
@@ -410,13 +498,21 @@ class ImageCapture:
 
 class ThreadedCapture:
     """
-    Reads a camera / stream in a background thread and always hands out the
-    NEWEST frame. Stale frames are dropped, so the view never lags behind
-    even when detection is slower than the camera. Mimics the parts of
-    cv2.VideoCapture that the pipeline uses.
+    Reads a camera / stream / video file in a background thread and keeps the
+    NEWEST frame. Stale frames are dropped, so the view never lags behind even
+    when detection is slower than the source.
+
+    paced=True  plays a video FILE at its real speed, like a live camera
+                (frames the detector cannot keep up with are simply skipped).
+    autostart=False  open now, call start() later (so a file does not begin
+                playing while models are still loading).
+
+    read()  waits for a NEW frame (used by the detector).
+    peek()  returns the newest frame without consuming it (used for display).
     """
 
-    def __init__(self, source, width=1280, height=720):
+    def __init__(self, source, width=1280, height=720,
+                 paced=False, autostart=True):
 
         if isinstance(source, str) and source.lower().startswith("rtsp"):
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
@@ -430,16 +526,30 @@ class ThreadedCapture:
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
 
+        self.paced = paced
         self._lock = threading.Lock()
         self._frame = None
         self._seq = 0
         self._last_seq = 0
+        self._index = 0
+        self._ended = False
         self._running = self.cap.isOpened()
+        self._thread = None
 
-        self._thread = threading.Thread(target=self._reader, daemon=True)
+        if autostart:
+            self.start()
+
+    def start(self):
+        if self._thread is not None or not self._running:
+            return
+
+        target = self._read_paced if self.paced else self._read_live
+        self._thread = threading.Thread(target=target, daemon=True)
         self._thread.start()
 
-    def _reader(self):
+    # ---- background readers ----
+
+    def _read_live(self):
         while self._running:
             ok, frame = self.cap.read()
 
@@ -451,14 +561,72 @@ class ThreadedCapture:
                 self._frame = frame
                 self._seq += 1
 
+    def _read_paced(self):
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+
+        if not fps or fps <= 0 or fps > 120:
+            fps = 25
+
+        start = time.perf_counter()
+        index = 0
+
+        while self._running:
+
+            wait = start + index / fps - time.perf_counter()
+
+            if wait > 0:
+                time.sleep(min(wait, 0.01))
+                continue
+
+            ok, frame = self.cap.read()
+
+            if not ok:
+                break
+
+            index += 1
+
+            # Decoding slower than real time: skip frames to catch up
+            behind = int((time.perf_counter() - (start + index / fps)) * fps)
+
+            for _ in range(max(0, behind)):
+                if not self.cap.grab():
+                    break
+                index += 1
+
+            with self._lock:
+                self._frame = frame
+                self._seq += 1
+                self._index = index
+
+        self._ended = True
+
+    # ---- cv2.VideoCapture-like API ----
+
     def isOpened(self):
         return self.cap.isOpened()
 
     def get(self, prop):
         return self.cap.get(prop)
 
+    @property
+    def frame_index(self):
+        """Position (in source frames) of the newest frame."""
+        return self._index
+
+    @property
+    def ended(self):
+        return self._ended
+
+    def peek(self):
+        """Newest frame WITHOUT consuming it. Do not modify the returned array."""
+        with self._lock:
+            if self._frame is None:
+                return None, 0
+
+            return self._frame, self._seq
+
     def read(self, timeout=3.0):
-        """Wait for a NEW frame. Returns (False, None) if the camera stalls."""
+        """Wait for a NEW frame. Returns (False, None) at the end / on a stall."""
         deadline = time.time() + timeout
 
         while time.time() < deadline:
@@ -467,13 +635,19 @@ class ThreadedCapture:
                     self._last_seq = self._seq
                     return True, self._frame.copy()
 
+                if self._ended:
+                    return False, None
+
             time.sleep(0.003)
 
         return False, None
 
     def release(self):
         self._running = False
-        self._thread.join(timeout=1.0)
+
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
         self.cap.release()
 
 
@@ -550,6 +724,7 @@ class ViolationPipeline:
         return {
             "box": [x1 + ox, y1 + oy, x2 + ox, y2 + oy],
             "head": head_from_keypoints(keypoints, confidences),
+            "hip": hip_from_keypoints(keypoints, confidences),
             "conf": float(box.conf[0]),
         }
 
@@ -630,7 +805,8 @@ class ViolationPipeline:
                     "cls": int(b.cls[0]),
                 })
 
-        return dedupe_people(people), dedupe_detections(helmets)
+        people = dedupe_detections(dedupe_people(people), PERSON_DUP_IOU)
+        return people, dedupe_detections(helmets)
 
     # ---------------------------------------------------------------
 
@@ -656,26 +832,37 @@ class ViolationPipeline:
         if due:
             due_bikes = [motorcycles[i] for i in due]
 
+            # Crops are only cut for the bikes that are due (speed) ...
             people, helmet_dets = self._analyze_crops(frame, due_bikes)
 
+            # ... but people and heads are matched against ALL current bikes,
+            # so a neighbouring bike can claim its own riders.
             counts, rider_boxes, other_boxes = assign_people_to_bikes(
-                people, due_bikes
+                people, motorcycles
             )
             owners = assign_heads_to_bikes(
-                helmet_dets, due_bikes, rider_boxes, other_boxes
+                helmet_dets, motorcycles, rider_boxes, other_boxes
             )
 
-            for j, i in enumerate(due):
+            for i in due:
                 bike = motorcycles[i]
+                track_id = bike["track_id"]
 
                 heads = [
                     {"box": det["box"], "cls": det["cls"], "extra": extra}
-                    for det, owner_j, extra in owners if owner_j == j
+                    for det, owner_i, extra in owners if owner_i == i
                 ]
 
-                cache[bike["track_id"]] = {
+                raw = counts[i] + sum(1 for h in heads if h["extra"])
+
+                previous = cache.get(track_id)
+                history = (previous["history"] if previous else []) + [raw]
+                history = history[-COUNT_HISTORY:]
+
+                cache[track_id] = {
                     "anchor": (bike["box"][0], bike["box"][1]),
-                    "count": counts[j] + sum(1 for h in heads if h["extra"]),
+                    "count": smoothed_count(history),
+                    "history": history,
                     "heads": heads,
                     "seen": frame_count,
                 }
@@ -709,7 +896,8 @@ class ViolationPipeline:
 
     def run(self, source, show_window=False,
             frame_callback=None, callback_every=2, should_stop=None,
-            live=False, save_video=True, pace_to_fps=True):
+            live=False, save_video=True, pace_to_fps=True,
+            realtime=False, display_callback=None):
         """
         Process a video file, or a live camera/stream when `source` is a
         camera index (int) or `live=True`. Returns a summary dict.
@@ -718,6 +906,13 @@ class ViolationPipeline:
         save_video  write the annotated output video
         pace_to_fps with a preview window, play files at their real speed
                     (never faster) so playback looks smooth
+        realtime    play a video FILE at its real speed and let detection skip
+                    frames to keep up (like a live camera)
+        display_callback(frame_bgr)  if given, a separate thread calls it with
+                    the video at full speed (about source fps), drawing the
+                    latest detections on top. Detection speed no longer limits
+                    how smooth the video looks; the boxes update as fast as
+                    the models allow. Called from a background thread.
 
         frame_callback(annotated_frame, stats) is called every
         `callback_every` frames (used by the Streamlit dashboard).
@@ -731,10 +926,16 @@ class ViolationPipeline:
             and source.lower().endswith(IMAGE_EXTENSIONS)
         )
 
+        realtime = (realtime or live) and not is_image
+        paced_file = realtime and not live
+        wall_clock = live or paced_file
+
         if live:
             cap = ThreadedCapture(source)
         elif is_image:
             cap = ImageCapture(source)
+        elif paced_file:
+            cap = ThreadedCapture(source, paced=True, autostart=False)
         else:
             cap = cv2.VideoCapture(source)
 
@@ -768,7 +969,7 @@ class ViolationPipeline:
 
         writer = None
 
-        if save_video and not is_image:
+        if save_video and not is_image and not paced_file:
             # Live frames are dropped when detection is slow, so record at a
             # modest fixed rate instead of the camera's nominal fps.
             writer = cv2.VideoWriter(
@@ -831,14 +1032,62 @@ class ViolationPipeline:
         def make_stats():
             return {
                 "run_id": run_id,
-                "frame": frame_count,
+                "frame": cap.frame_index if paced_file else frame_count,
                 "total_frames": total_frames,
+                "detector_fps": frame_count / max(1e-6, time.perf_counter() - t_start),
                 "motorcycles": len(seen_ids),
                 "helmet_violations": len(helmet_ids),
                 "triple_riding": len(triple_ids),
                 "plates_read": len(plate_tracker.plates),
                 "evidence_saved": evidence_count,
             }
+
+        # ---------- Smooth display, decoupled from detection ----------
+        display_thread = None
+        display_stop = threading.Event()
+        overlay = {"data": None}
+        overlay_lock = threading.Lock()
+
+        disp_w = min(width, 960)
+        disp_h = max(1, int(height * disp_w / width))
+
+        if display_callback is not None and realtime:
+
+            def display_loop():
+                last_seq = -1
+
+                while not display_stop.is_set():
+                    frame_now, seq = cap.peek()
+
+                    if frame_now is None or seq == last_seq:
+                        time.sleep(0.004)
+                        continue
+
+                    last_seq = seq
+
+                    try:
+                        small = cv2.resize(frame_now, (disp_w, disp_h),
+                                           interpolation=cv2.INTER_AREA)
+
+                        with overlay_lock:
+                            data = overlay["data"]
+
+                        if data is not None:
+                            mask, pixels = data
+                            np.copyto(small, pixels, where=mask)
+
+                        display_callback(small)
+                    except Exception as error:  # never let display kill the run
+                        print(f"Display error: {error}")
+                        time.sleep(0.05)
+
+            display_thread = threading.Thread(target=display_loop, daemon=True)
+
+        if paced_file:
+            cap.start()          # the file starts playing now, models are loaded
+
+        if display_thread is not None:
+            display_thread.start()
 
         try:
             while True:
@@ -852,9 +1101,12 @@ class ViolationPipeline:
                     break
 
                 frame_count += 1
-                video_time = (
-                    time.perf_counter() - t_start if live else frame_count / fps
-                )
+                if live:
+                    video_time = time.perf_counter() - t_start
+                elif paced_file:
+                    video_time = cap.frame_index / fps
+                else:
+                    video_time = frame_count / fps
 
                 # ---------- Motorcycle tracking ----------
                 t0 = time.perf_counter()
@@ -903,6 +1155,10 @@ class ViolationPipeline:
                         px1, py1, px2, py2 = map(int, person["box"])
                         cv2.rectangle(annotated, (px1, py1), (px2, py2),
                                       BLUE, style.thin)
+
+                        seat_x, seat_y = person_seat_point(person)
+                        cv2.circle(annotated, (int(seat_x), int(seat_y)),
+                                   max(4, style.thin * 2), (255, 0, 255), -1)
 
                 # ---------- Draw helmet detections ----------
                 no_helmet_by_moto = {}
@@ -1058,6 +1314,18 @@ class ViolationPipeline:
                         f"per frame"
                     )
 
+                if display_thread is not None:
+                    changed = np.any(annotated != frame, axis=2).astype(np.uint8)
+                    small_mask = cv2.resize(
+                        changed, (disp_w, disp_h), interpolation=cv2.INTER_AREA
+                    ) > 0
+                    small_pixels = cv2.resize(
+                        annotated, (disp_w, disp_h), interpolation=cv2.INTER_AREA
+                    )
+
+                    with overlay_lock:
+                        overlay["data"] = (small_mask[:, :, None], small_pixels)
+
                 if writer is not None:
                     writer.write(annotated)
 
@@ -1076,13 +1344,18 @@ class ViolationPipeline:
                         break
 
                     # Never play faster than real time: keeps preview smooth
-                    if pace_to_fps and not live:
+                    if pace_to_fps and not wall_clock:
                         wait = (t_start + frame_count / fps) - time.perf_counter()
 
                         if wait > 0:
                             time.sleep(wait)
 
         finally:
+            display_stop.set()
+
+            if display_thread is not None and display_thread.is_alive():
+                display_thread.join(timeout=1.0)
+
             cap.release()
 
             if writer is not None:
@@ -1100,7 +1373,8 @@ class ViolationPipeline:
 
         stats = make_stats()
         stats["output_video"] = (
-            output_video_path if (save_video and not is_image) else None
+            output_video_path
+            if (save_video and not is_image and not paced_file) else None
         )
         stats["output_image"] = None
 

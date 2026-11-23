@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from urllib.parse import urlparse
 
 import cv2
@@ -21,6 +22,7 @@ import streamlit as st
 
 from pipeline import ViolationPipeline, IMAGE_EXTENSIONS
 from video_menu import list_videos, find_cameras
+from stream_server import MJPEGServer
 from violation_db import ViolationDB
 
 DB_PATH = "outputs/violations.db"
@@ -49,6 +51,12 @@ if "cameras" not in st.session_state:
 @st.cache_resource(show_spinner="Loading models (first time only)...")
 def load_pipeline(use_plates):
     return ViolationPipeline(use_plates=use_plates, db_path=DB_PATH)
+
+
+@st.cache_resource
+def get_stream_server():
+    """One local video-stream server for the whole dashboard session."""
+    return MJPEGServer()
 
 
 def show_image(container, image, **kwargs):
@@ -374,18 +382,49 @@ if use_plates and not plate_model_present:
 
 is_photo_mode = source_type == "Photo(s)"
 
+# Video files: play in real time (smooth) or process every single frame.
+playback_realtime = False
+
+if source_type == "Video file":
+    playback = st.sidebar.radio(
+        "Playback",
+        [
+            "Real-time (smooth video)",
+            "Process every frame (complete, plays at the end)",
+        ],
+        help="Real-time: the video plays at its normal speed and detection "
+             "keeps up as fast as your computer allows, so some frames are "
+             "skipped by the detector (the video itself is never choppy). "
+             "Process every frame: nothing is skipped, but it runs slower "
+             "than the video; the finished video plays when it is done.",
+    )
+    playback_realtime = playback.startswith("Real-time")
+
+# Webcams, CCTV and phones are always real time.
+realtime_mode = (is_live_mode or playback_realtime) and not is_photo_mode
+
 record_video = False
 
-if not is_photo_mode:
+if is_photo_mode:
+    pass
+elif playback_realtime:
+    st.sidebar.caption("To record the annotated video, use 'Process every "
+                       "frame'.")
+else:
     record_video = st.sidebar.checkbox(
         "Record the annotated video",
         value=not is_live_mode,
         help="Saved in outputs/videos",
     )
 
-update_every = st.sidebar.slider(
-    "Refresh the live view every N frames", 1, 10, 2 if is_live_mode else 3
-)
+update_every = 10
+
+if not realtime_mode and not is_photo_mode:
+    update_every = st.sidebar.slider(
+        "Progress preview every N frames", 1, 30, 10,
+        help="Only a progress peek while processing; the finished video "
+             "plays smoothly at the end. Higher = faster processing.",
+    )
 
 start = st.sidebar.button("Start", type="primary", disabled=not jobs)
 st.sidebar.button("Stop", help="Ends the current run.")
@@ -437,7 +476,7 @@ with tab_live:
             "**Results** tab."
         )
 
-    def make_callback(label, is_live):
+    def make_callback(label, is_live, show_frames=True):
 
         state = {"helmet": 0, "triple": 0, "evidence": -1}
         progress = progress_slot.progress(0.0) if not is_live else None
@@ -447,22 +486,40 @@ with tab_live:
             run_id = stats["run_id"]
             st.session_state.runs[run_id] = {"label": label, "stats": stats}
 
-            h, w = frame_bgr.shape[:2]
+            if show_frames:
+                h, w = frame_bgr.shape[:2]
 
-            if w > 960:
-                frame_bgr = cv2.resize(frame_bgr, (960, int(h * 960 / w)))
+                if w > 960:
+                    frame_bgr = cv2.resize(frame_bgr, (960, int(h * 960 / w)))
 
-            show_image(frame_slot, cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+                show_image(frame_slot, cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+
             render_metrics(stats)
 
+            detector_fps = stats.get("detector_fps", 0.0)
+
             if is_live:
-                status_slot.caption(f"LIVE | {label} | frame {stats['frame']}")
+                status_slot.caption(
+                    f"LIVE | {label} | detector {detector_fps:.1f} fps "
+                    "(the video is smooth; boxes refresh at the detector speed)"
+                )
             else:
                 done = min(1.0, stats["frame"] / max(1, stats["total_frames"]))
                 progress.progress(done)
-                status_slot.caption(
-                    f"{label} | frame {stats['frame']} of {stats['total_frames']}"
-                )
+
+                if show_frames:
+                    status_slot.caption(
+                        f"Processing {label} | frame {stats['frame']} of "
+                        f"{stats['total_frames']} | this is a progress peek; "
+                        "the smooth, full-speed video plays when processing "
+                        "finishes"
+                    )
+                else:
+                    status_slot.caption(
+                        f"Playing {label} in real time | detector "
+                        f"{detector_fps:.1f} fps (the video is smooth; boxes "
+                        "refresh at the detector speed)"
+                    )
 
             # Alerts for new violations
             if stats["helmet_violations"] > state["helmet"]:
@@ -498,14 +555,33 @@ with tab_live:
             if len(jobs) > 1:
                 st.toast(f"Processing {number} of {len(jobs)}: {label}")
 
+            display_callback = None
+
+            if realtime_mode:
+                server = get_stream_server()
+                display_callback = server.push
+
+                # Browser <img> that plays the stream continuously
+                frame_slot.markdown(
+                    f'<img src="{server.url}?t={int(time.time() * 1000)}" '
+                    'style="width:100%; border-radius:6px;" alt="live view">',
+                    unsafe_allow_html=True,
+                )
+
             try:
                 summary = pipeline.run(
                     source,
                     show_window=False,
-                    frame_callback=make_callback(label, is_live),
-                    callback_every=1 if is_photo_mode else update_every,
+                    frame_callback=make_callback(
+                        label, is_live, show_frames=not realtime_mode
+                    ),
+                    callback_every=(
+                        1 if is_photo_mode else (3 if realtime_mode else update_every)
+                    ),
                     live=is_live,
                     save_video=record_video,
+                    realtime=realtime_mode,
+                    display_callback=display_callback,
                 )
             except RuntimeError as error:
                 st.error(f"Could not open **{label}**: {error}")
@@ -516,6 +592,24 @@ with tab_live:
                 "stats": summary,
             }
             last_run_id = summary["run_id"]
+
+            # Files: replace the progress peek with the finished, smooth video
+            out_video = summary.get("output_video")
+
+            if not is_live and out_video and os.path.exists(out_video):
+                progress_slot.empty()
+                playable = browser_video(out_video, os.path.getmtime(out_video))
+
+                if playable:
+                    frame_slot.video(playable)
+                else:
+                    frame_slot.warning(
+                        "Processing finished. For smooth in-page playback, "
+                        "install video support with `pip install imageio-ffmpeg` "
+                        "and restart the dashboard. Meanwhile the video is saved "
+                        f"at `{out_video}` and can be downloaded from the "
+                        "Results tab."
+                    )
 
         if last_run_id:
             status_slot.success(
