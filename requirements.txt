@@ -6,3 +6,4 @@ numpy
 streamlit
 supervision>=0.32.0
 easyocr>=1.7.2
+lap>=0.5.12lap>=0.5.12
