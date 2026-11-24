@@ -138,6 +138,10 @@ class MJPEGServer:
             return self._jpeg, self._seq
 
     def close(self):
+        """Stop the server. Safe to call more than once."""
+        if self.closed:
+            return
+
         self.closed = True
 
         with self._cond:
@@ -146,5 +150,5 @@ class MJPEGServer:
         try:
             self.httpd.shutdown()
             self.httpd.server_close()
-        except Exception:
-            pass
+        except OSError:
+            pass  # already closed

@@ -20,17 +20,19 @@ import cv2
 import pandas as pd
 import streamlit as st
 
-from pipeline import ViolationPipeline, IMAGE_EXTENSIONS
-from video_menu import list_videos, find_cameras
+import settings as cfg
+from capture import IMAGE_EXTENSIONS
+from pipeline import ViolationPipeline
 from stream_server import MJPEGServer
+from video_menu import find_cameras, list_videos
 from violation_db import ViolationDB
 
-DB_PATH = "outputs/violations.db"
-VIDEO_FOLDER = "data/videos"
-VIDEO_UPLOADS = "data/videos/uploads"
-PHOTO_FOLDER = "data/images"
-PHOTO_UPLOADS = "data/images/uploads"
-PLATE_MODEL = "models/plate_detector.pt"
+DB_PATH = str(cfg.DB_PATH)
+VIDEO_FOLDER = str(cfg.VIDEO_DIR)
+VIDEO_UPLOADS = str(cfg.VIDEO_UPLOAD_DIR)
+PHOTO_FOLDER = str(cfg.IMAGE_DIR)
+PHOTO_UPLOADS = str(cfg.IMAGE_UPLOAD_DIR)
+PLATE_MODEL = cfg.model_path(cfg.PLATE_MODEL)
 
 for folder in (VIDEO_UPLOADS, PHOTO_UPLOADS):
     os.makedirs(folder, exist_ok=True)
@@ -86,10 +88,20 @@ def list_photos(folder):
 
 
 def save_upload(uploaded, folder):
-    path = os.path.join(folder, uploaded.name)
+    """
+    Save an uploaded file inside `folder` and return its path.
 
-    with open(path, "wb") as f:
-        f.write(uploaded.getbuffer())
+    Only the file NAME is used (no directories), so a crafted name such as
+    "../../x.py" cannot write outside the folder. Streamlit re-runs this on
+    every click, so an identical file already on disk is not written again.
+    """
+    name = os.path.basename(uploaded.name.replace("\\", "/")) or "upload"
+    path = os.path.join(folder, name)
+    data = uploaded.getbuffer()
+
+    if not (os.path.exists(path) and os.path.getsize(path) == len(data)):
+        with open(path, "wb") as f:
+            f.write(data)
 
     return path
 
@@ -427,7 +439,7 @@ if not realtime_mode and not is_photo_mode:
     )
 
 start = st.sidebar.button("Start", type="primary", disabled=not jobs)
-st.sidebar.button("Stop", help="Ends the current run.")
+st.sidebar.button("Stop", help="Ends the current run (any click on the page also interrupts it).")
 
 if ready_hint and not jobs:
     st.sidebar.info(ready_hint)
@@ -547,7 +559,12 @@ with tab_live:
 
     if start and jobs:
 
-        pipeline = load_pipeline(use_plates)
+        try:
+            pipeline = load_pipeline(use_plates)
+        except FileNotFoundError as error:
+            st.error(str(error))
+            st.stop()
+
         last_run_id = None
 
         for number, (source, label, is_live) in enumerate(jobs, start=1):
@@ -662,7 +679,7 @@ with tab_results:
 
             with open(out_video, "rb") as f:
                 st.download_button(
-                    "Download processed video", f.read(),
+                    "Download processed video", f,
                     file_name=os.path.basename(out_video), mime="video/mp4",
                 )
 
@@ -723,10 +740,12 @@ with tab_results:
             cols = st.columns(3)
 
             for i, r in enumerate(shown):
+                seconds = (
+                    f"{r['video_time']:.1f}s" if r["video_time"] is not None else "-"
+                )
                 caption = (
                     f"bike {r['track_id']} | {r['violation_type']} | "
-                    f"{r['plate_number'] or 'plate not read'} | "
-                    f"{r['video_time']:.1f}s"
+                    f"{r['plate_number'] or 'plate not read'} | {seconds}"
                 )
                 show_image(cols[i % 3], r["evidence_path"], caption=caption)
 

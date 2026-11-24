@@ -1,9 +1,24 @@
-from pathlib import Path
+"""
+Interactive photo / video tester (menu driven, shows results in a window).
+
+    python src/interactive_tester.py
+
+Uses a heavier full-frame method with extra helmet re-checks, which suits
+single photos. For videos, tracking, evidence and the database use
+``detect_video_full.py`` or the dashboard instead.
+"""
+
+from __future__ import annotations
+
 import math
+from pathlib import Path
 
 import cv2
 from ultralytics import YOLO
 
+import settings as cfg
+from geometry import ioa as box_ioa
+from geometry import iou as box_iou
 from rider_association import (
     associate_riders,
     count_riders,
@@ -18,22 +33,22 @@ from rider_association import (
 # PROJECT SETTINGS
 # ============================================================
 
-VIDEO_DIR = Path("data/videos")
-IMAGE_DIR = Path("data/test_images")
+VIDEO_DIR = cfg.VIDEO_DIR
+IMAGE_DIR = cfg.TEST_IMAGE_DIR
 
-OUTPUT_IMAGE_DIR = Path("runs/test_images")
-OUTPUT_VIDEO_DIR = Path("runs/videos")
+OUTPUT_IMAGE_DIR = cfg.PROJECT_ROOT / "runs" / "test_images"
+OUTPUT_VIDEO_DIR = cfg.PROJECT_ROOT / "runs" / "videos"
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
+IMAGE_EXTENSIONS = set(cfg.IMAGE_EXTENSIONS)
+VIDEO_EXTENSIONS = set(cfg.VIDEO_EXTENSIONS)
 
 # Detects motorcycles. Tested on a hard close-up photo taken through a car
 # window: yolo11n found the bike at only 0.16 confidence, yolo11s at 0.61
 # and yolo11m at 0.93. For video on a slow computer use "yolo11s.pt" or
 # "yolo11n.pt" (faster, but misses more bikes).
 TRAFFIC_MODEL = "yolo11m.pt"
-POSE_MODEL = "yolo11n-pose.pt"
-HELMET_MODEL = "models/helmet_detector.pt"
+POSE_MODEL = cfg.POSE_MODEL
+HELMET_MODEL = cfg.HELMET_MODEL
 
 IMAGE_IMGSZ = 960
 VIDEO_IMGSZ = 640
@@ -123,10 +138,19 @@ def get_models():
         print("\nLoading YOLO11 models...")
         print("Please wait.")
 
+        helmet_file = cfg.model_path(HELMET_MODEL)
+
+        if not Path(helmet_file).exists():
+            raise FileNotFoundError(
+                f"Helmet model not found: {helmet_file}\n"
+                "Place helmet_detector.pt in the models/ folder "
+                "(see models/README.md)."
+            )
+
         _model_cache = (
-            YOLO(TRAFFIC_MODEL),
-            YOLO(POSE_MODEL),
-            YOLO(HELMET_MODEL),
+            YOLO(cfg.model_path(TRAFFIC_MODEL)),
+            YOLO(cfg.model_path(POSE_MODEL)),
+            YOLO(helmet_file),
         )
 
         print("All models loaded successfully!")
@@ -137,21 +161,6 @@ def get_models():
 # ============================================================
 # GEOMETRY HELPERS
 # ============================================================
-
-def box_iou(a, b):
-
-    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
-    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
-
-    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-
-    area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
-    area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
-
-    union = area_a + area_b - inter
-
-    return inter / union if union > 0 else 0.0
-
 
 def head_of(person):
     """Head point from keypoints, or an estimate from the box."""
@@ -177,22 +186,6 @@ def rider_status(helmet):
         return UNCERTAIN
 
     return helmet["status"]
-
-
-def box_ioa(a, b):
-    """Intersection over the SMALLER box (1.0 = fully contained)."""
-
-    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
-    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
-
-    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-
-    area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
-    area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
-
-    smaller = min(area_a, area_b)
-
-    return inter / smaller if smaller > 0 else 0.0
 
 
 def is_plausible_rider(person, moto):
@@ -464,7 +457,7 @@ def suppress_duplicate_people(people):
                 break
 
         if duplicate:
-            print(f"  [debug] dropped duplicate person P{person['id']}")
+            pass  # duplicate person dropped
         else:
             kept.append(person)
 
@@ -1071,7 +1064,7 @@ def fit_to_screen(image, max_width=1100, max_height=750):
 # PHOTO TESTING
 # ============================================================
 
-def test_image(image_path, expected=None):
+def run_photo_test(image_path, expected=None):
 
     print("\nStarting photo detection...")
 
@@ -1099,19 +1092,21 @@ def test_image(image_path, expected=None):
 
     print(f"\nAnnotated photo saved at: {output_path}")
 
-    cv2.imshow(
-        "Two-Wheeler Safety - Photo Testing", fit_to_screen(annotated)
-    )
-
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    try:
+        cv2.imshow(
+            "Two-Wheeler Safety - Photo Testing", fit_to_screen(annotated)
+        )
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+    except cv2.error:
+        print("(No display available - open the saved photo instead.)")
 
 
 # ============================================================
 # VIDEO TESTING
 # ============================================================
 
-def test_video(video_path, expected=None):
+def run_video_test(video_path, expected=None):
 
     print("\nStarting video detection...")
     print(f"Analysing every {PROCESS_EVERY} frames.")
@@ -1189,12 +1184,16 @@ def test_video(video_path, expected=None):
 
             writer.write(annotated)
 
-            cv2.imshow(
-                "Two-Wheeler Safety - Video Testing",
-                fit_to_screen(annotated)
-            )
+            try:
+                cv2.imshow(
+                    "Two-Wheeler Safety - Video Testing",
+                    fit_to_screen(annotated)
+                )
+                key = cv2.waitKey(1) & 0xFF
+            except cv2.error:
+                key = 0  # headless: keep processing, just no window
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            if key == ord("q"):
                 print("\nVideo stopped by user.")
                 break
 
@@ -1204,7 +1203,10 @@ def test_video(video_path, expected=None):
 
         capture.release()
         writer.release()
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass
 
     print("\nVIDEO TESTING SUMMARY")
     print("-" * 45)
@@ -1225,9 +1227,12 @@ def get_expected_count():
 
     while True:
 
-        value = input(
-            "\nEnter expected rider count (or press Enter to skip): "
-        ).strip()
+        try:
+            value = input(
+                "\nEnter expected rider count (or press Enter to skip): "
+            ).strip()
+        except EOFError:
+            return None
 
         if not value:
             return None
@@ -1284,7 +1289,10 @@ def select_file(folder, extensions, file_type):
 
     while True:
 
-        choice = input("\nSelect a file by entering its number: ").strip()
+        try:
+            choice = input("\nSelect a file by entering its number: ").strip()
+        except EOFError:
+            return None
 
         if choice == "0":
             return None
@@ -1309,6 +1317,12 @@ def select_file(folder, extensions, file_type):
 
 def main():
 
+    try:
+        get_models()
+    except FileNotFoundError as error:
+        print(f"ERROR: {error}")
+        return 1
+
     while True:
 
         print("\n" + "=" * 60)
@@ -1321,13 +1335,16 @@ def main():
         print("  0. Exit")
         print("-" * 60)
 
-        choice = input("\nEnter your choice: ").strip()
+        try:
+            choice = input("\nEnter your choice: ").strip()
+        except EOFError:
+            choice = "0"
 
         if choice == "0":
 
             print("\nThank you for using the system.")
             print("Exiting...")
-            break
+            return 0
 
         elif choice == "1":
 
@@ -1338,7 +1355,7 @@ def main():
                 expected = get_expected_count()
 
                 print("\nSelected photo:", selected.name)
-                test_image(selected, expected)
+                run_photo_test(selected, expected)
                 print("\nPhoto testing completed.")
 
         elif choice == "2":
@@ -1350,7 +1367,7 @@ def main():
                 expected = get_expected_count()
 
                 print("\nSelected video:", selected.name)
-                test_video(selected, expected)
+                run_video_test(selected, expected)
                 print("\nVideo testing completed.")
 
         else:
@@ -1359,4 +1376,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

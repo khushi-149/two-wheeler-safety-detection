@@ -9,12 +9,15 @@ Two modes:
      motorcycle box and only accepts text that matches the Indian plate format.
 """
 
+import logging
 import os
 import queue
 import re
 import threading
 
 import cv2
+
+log = logging.getLogger(__name__)
 
 ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
@@ -26,6 +29,36 @@ TO_DIGIT = {"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1",
             "Z": "2", "S": "5", "B": "8", "G": "6", "T": "7"}
 TO_LETTER = {"0": "O", "1": "I", "2": "Z", "5": "S",
              "8": "B", "6": "G", "7": "T"}
+
+
+# The motorcycle box often cuts off the number plate (it hangs on the mudguard,
+# below the bike), so the plate search area is a little larger than the box.
+PLATE_PAD_SIDE = 0.10
+PLATE_PAD_BOTTOM = 0.20
+PLATE_IMGSZ_MAX = 1280
+MAX_PLATE_CANDIDATES = 3
+
+
+def search_region(frame_shape, moto_box):
+    """Motorcycle box widened for the plate search, clipped to the frame."""
+    h, w = frame_shape[:2]
+    x1, y1, x2, y2 = map(int, moto_box)
+    bw, bh = x2 - x1, y2 - y1
+
+    return (
+        max(0, x1 - int(bw * PLATE_PAD_SIDE)),
+        max(0, y1),
+        min(w, x2 + int(bw * PLATE_PAD_SIDE)),
+        min(h, y2 + int(bh * PLATE_PAD_BOTTOM)),
+    )
+
+
+def plausible_plate_shape(width, height):
+    """Plates are 1:1 to about 6:1 (two-line to one-line). Anything else is noise."""
+    if width < 12 or height < 6:
+        return False
+
+    return 0.8 <= width / height <= 6.5
 
 
 def _fix(chars, mapping):
@@ -51,7 +84,7 @@ def normalize_plate(raw):
 
 
 def _preprocess(crop):
-    h, w = crop.shape[:2]
+    w = crop.shape[1]
     scale = min(4.0, max(1.0, 200.0 / max(w, 1)))
 
     if scale > 1.0:
@@ -61,6 +94,23 @@ def _preprocess(crop):
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     return clahe.apply(gray)
+
+
+def _variants(crop):
+    """Image treatments to try, best-first: contrast-enhanced, plain, black/white."""
+    enhanced = _preprocess(crop)
+    yield enhanced
+
+    w = crop.shape[1]
+    scale = min(4.0, max(1.0, 200.0 / max(w, 1)))
+    plain = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+
+    if scale > 1.0:
+        plain = cv2.resize(plain, None, fx=scale, fy=scale,
+                           interpolation=cv2.INTER_CUBIC)
+
+    yield plain
+    yield cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
 
 
 def _assemble(results):
@@ -116,8 +166,8 @@ class PlateReader:
             except ImportError:
                 use_gpu = False
 
-        print(f"Loading EasyOCR (GPU={use_gpu}). The first run downloads "
-              "its models, which can take a few minutes...")
+        log.info("Loading EasyOCR (GPU=%s). The first run downloads its "
+                 "models, which can take a few minutes...", use_gpu)
 
         self.ocr = easyocr.Reader(["en"], gpu=use_gpu, verbose=False)
         self.plate_conf = plate_conf
@@ -126,12 +176,10 @@ class PlateReader:
         if os.path.exists(plate_model_path):
             from ultralytics import YOLO
             self.plate_model = YOLO(plate_model_path)
-            print(f"Plate detector loaded: {plate_model_path}")
+            log.info("Plate detector loaded: %s", plate_model_path)
         else:
-            print(
-                f"Warning: {plate_model_path} not found. "
-                "Using OCR-only fallback (lower accuracy)."
-            )
+            log.warning("%s not found. Using OCR-only fallback (lower accuracy).",
+                        plate_model_path)
 
     # ---------------------------------------------------------------
 
@@ -141,10 +189,7 @@ class PlateReader:
         Returns dict {text, conf, valid, box, crop} or None.
         box is in full-frame coordinates (or None in fallback mode).
         """
-        h, w = frame.shape[:2]
-        x1, y1, x2, y2 = map(int, moto_box)
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
+        x1, y1, x2, y2 = search_region(frame.shape, moto_box)
 
         if x2 - x1 < 40 or y2 - y1 < 40:
             return None
@@ -160,38 +205,60 @@ class PlateReader:
 
     def _read_with_detector(self, region, ox, oy):
 
+        rh, rw = region.shape[:2]
+        imgsz = min(PLATE_IMGSZ_MAX, max(640, -(-max(rh, rw) // 32) * 32))
+
         result = self.plate_model(
-            region, conf=self.plate_conf, verbose=False
+            region, conf=self.plate_conf, imgsz=imgsz, verbose=False
         )[0]
 
         if result.boxes is None or len(result.boxes) == 0:
             return None
 
-        best = max(result.boxes, key=lambda b: float(b.conf[0]))
-        px1, py1, px2, py2 = map(int, best.xyxy[0].cpu().tolist())
+        # Best-scoring candidates first; boxes with an impossible shape are skipped
+        candidates = sorted(result.boxes, key=lambda b: -float(b.conf[0]))
+        chosen = None
+        tried = 0
 
-        # small padding helps OCR
-        pad_x = int(0.05 * (px2 - px1))
-        pad_y = int(0.10 * (py2 - py1))
-        rh, rw = region.shape[:2]
+        for box in candidates:
+            if tried >= MAX_PLATE_CANDIDATES:
+                break
 
-        px1, py1 = max(0, px1 - pad_x), max(0, py1 - pad_y)
-        px2, py2 = min(rw, px2 + pad_x), min(rh, py2 + pad_y)
+            px1, py1, px2, py2 = map(int, box.xyxy[0].cpu().tolist())
 
-        crop = region[py1:py2, px1:px2]
+            if not plausible_plate_shape(px2 - px1, py2 - py1):
+                continue
 
-        if crop.size == 0:
-            return None
+            tried += 1
 
-        ocr_result = self._ocr(crop)
+            # small padding helps OCR
+            pad_x = int(0.05 * (px2 - px1))
+            pad_y = int(0.10 * (py2 - py1))
+            px1, py1 = max(0, px1 - pad_x), max(0, py1 - pad_y)
+            px2, py2 = min(rw, px2 + pad_x), min(rh, py2 + pad_y)
 
-        if ocr_result is None:
-            return None
+            crop = region[py1:py2, px1:px2]
 
-        ocr_result["box"] = (ox + px1, oy + py1, ox + px2, oy + py2)
-        ocr_result["crop"] = crop
+            if crop.size == 0:
+                continue
 
-        return ocr_result
+            ocr_result = self._ocr(crop)
+
+            if ocr_result is None:
+                continue
+
+            ocr_result["box"] = (ox + px1, oy + py1, ox + px2, oy + py2)
+            ocr_result["crop"] = crop
+
+            if chosen is None or (
+                    (ocr_result["valid"], ocr_result["conf"])
+                    > (chosen["valid"], chosen["conf"])):
+                chosen = ocr_result
+
+            if chosen["valid"]:
+                break
+
+        return chosen
 
     def _read_ocr_only(self, region):
 
@@ -213,20 +280,28 @@ class PlateReader:
         return ocr_result
 
     def _ocr(self, crop):
+        """Read a plate crop. Tries several image treatments and keeps the best."""
+        best = None
 
-        gray = _preprocess(crop)
+        for image in _variants(crop):
+            results = self.ocr.readtext(
+                image, allowlist=ALLOWLIST, detail=1, paragraph=False
+            )
+            raw_text, conf = _assemble(results)
+            text, valid = normalize_plate(raw_text)
 
-        results = self.ocr.readtext(
-            gray, allowlist=ALLOWLIST, detail=1, paragraph=False
-        )
+            if len(text) < 6:
+                continue
 
-        raw_text, conf = _assemble(results)
-        text, valid = normalize_plate(raw_text)
+            candidate = {"text": text, "conf": conf, "valid": valid}
 
-        if len(text) < 6:
-            return None
+            if best is None or (valid, conf) > (best["valid"], best["conf"]):
+                best = candidate
 
-        return {"text": text, "conf": conf, "valid": valid}
+            if valid and conf >= 0.60:      # good enough: skip the remaining variants
+                break
+
+        return best
 
 
 class PlateTracker:
@@ -295,10 +370,7 @@ class AsyncPlateReader:
         if track_id in self.pending:
             return False
 
-        h, w = frame.shape[:2]
-        x1, y1, x2, y2 = map(int, moto_box)
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
+        x1, y1, x2, y2 = search_region(frame.shape, moto_box)
 
         if x2 - x1 < 40 or y2 - y1 < 40:
             return False
@@ -349,7 +421,7 @@ class AsyncPlateReader:
             pass
 
         if self.pending and self._thread.is_alive():
-            print("Finishing the plate read in progress...")
+            log.info("Finishing the plate read in progress...")
 
         self._thread.join(timeout=timeout)
 
@@ -370,7 +442,7 @@ class AsyncPlateReader:
                     bx1, by1, bx2, by2 = result["box"]
                     result["box"] = (bx1 + ox, by1 + oy, bx2 + ox, by2 + oy)
             except Exception as error:  # never let the worker thread die
-                print(f"Plate OCR error: {error}")
+                log.warning("Plate OCR error: %s", error)
                 result = None
 
             self.results.put((track_id, result))

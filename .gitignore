@@ -2,10 +2,29 @@
 __pycache__/
 *.py[cod]
 venv/
+.venv/
 .env
+.pytest_cache/
+.ruff_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
 
 # Dataset
 data/helmet_dataset/
+
+# Model weights are distributed through GitHub Releases, not git
+*.pt
+
+# Traffic videos, uploaded files and local test photos stay on your machine
+data/videos/*
+!data/videos/README.md
+data/images/*
+!data/images/README.md
+/data/test_images/
 
 # YOLO training outputs
 /runs/*
@@ -14,13 +33,8 @@ data/helmet_dataset/
 # Evaluation archive
 eval/helmet_evaluation.zip
 
-# Keep model weights locally
-*.pt
-
-# Keep traffic videos locally
-data/videos/*.mp4
-
-# Generated outputs: keep folder placeholders only
+# Generated outputs (evidence photos and number plates are personal data):
+# keep the folder placeholders only
 /outputs/*
 !/outputs/README.md
 !/outputs/evidence/
@@ -30,14 +44,8 @@ data/videos/*.mp4
 /outputs/videos/*
 !/outputs/videos/README.md
 
-# Local test images
-/data/test_images/
-
 # Extra generated test screenshots
 /screenshots/rider_count_test.jpg
 /screenshots/triple_1_annotated.jpg
 /screenshots/triple_5_annotated.jpg
 /screenshots/violation_*.jpg
-
-# Local backup file
-/src/detect_video_backup.py

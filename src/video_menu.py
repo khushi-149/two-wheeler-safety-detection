@@ -1,13 +1,23 @@
 """Find test videos in data/videos and let the user choose from a menu."""
 
+from __future__ import annotations
+
 import os
 
 import cv2
 
-VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".m4v", ".webm")
+from settings import VIDEO_DIR, VIDEO_EXTENSIONS
 
 
-def list_videos(folder="data/videos"):
+def _ask(prompt: str) -> str:
+    """input() that treats Ctrl+D / closed stdin as 'quit'."""
+    try:
+        return input(prompt).strip().lower()
+    except EOFError:
+        return "q"
+
+
+def list_videos(folder=VIDEO_DIR):
     """All video files under `folder` (including subfolders), sorted."""
     videos = []
 
@@ -21,7 +31,11 @@ def list_videos(folder="data/videos"):
 
 def describe_video(path):
     """Short description: resolution, duration, file size."""
-    size_mb = os.path.getsize(path) / (1024 * 1024)
+    try:
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+    except OSError:
+        return "unreadable"
+
     info = ""
 
     cap = cv2.VideoCapture(path)
@@ -39,7 +53,7 @@ def describe_video(path):
     return f"{info}{size_mb:.1f} MB"
 
 
-def choose_videos_cli(folder="data/videos"):
+def choose_videos_cli(folder=VIDEO_DIR):
     """
     Show a numbered menu. Returns a list of chosen video paths,
     or an empty list if the user quits.
@@ -47,6 +61,7 @@ def choose_videos_cli(folder="data/videos"):
     Accepts: a number (2), several numbers (1,3,4 or "1 3 4"),
     'a' for all videos, 'q' to quit.
     """
+    folder = str(folder)
     videos = list_videos(folder)
 
     if not videos:
@@ -64,7 +79,7 @@ def choose_videos_cli(folder="data/videos"):
         print("   a. Run ALL videos one after another")
         print("   q. Quit")
 
-        answer = input("\nChoose a video (number, e.g. 1,3 for several): ").strip().lower()
+        answer = _ask("\nChoose a video (number, e.g. 1,3 for several): ")
 
         if answer in ("q", "quit", "exit"):
             return []
@@ -84,7 +99,7 @@ def choose_videos_cli(folder="data/videos"):
         print(f"Invalid choice. Enter numbers between 1 and {len(videos)}, 'a' or 'q'.")
 
 
-def find_cameras(max_index=5):
+def find_cameras(max_index: int = 5) -> list[int]:
     """Return the indexes of cameras that actually deliver frames."""
     found = []
 
@@ -130,13 +145,16 @@ def choose_camera_cli():
         print("  u. Enter a stream URL (phone IP-camera app, RTSP, etc.)")
         print("  q. Quit")
 
-        answer = input("\nChoose a camera: ").strip().lower()
+        answer = _ask("\nChoose a camera: ")
 
         if answer in ("q", "quit", "exit"):
             return None
 
         if answer in ("u", "url"):
-            url = input("Stream URL: ").strip()
+            try:
+                url = input("Stream URL: ").strip()  # case matters in URLs
+            except EOFError:
+                return None
 
             if url:
                 return url

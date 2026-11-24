@@ -1,104 +1,166 @@
-# Two-Wheeler Safety Violation Detection System
+# Two-Wheeler Safety Violation Detection
 
-## Project Overview
+Computer-vision system that watches photos, videos and live cameras and flags two common
+two-wheeler safety violations:
 
-The **Two-Wheeler Safety Violation Detection System** is a computer vision project designed to detect common two-wheeler safety violations using YOLO object detection models.
+- **Riding without a helmet**
+- **Triple riding** (three or more people on one motorcycle)
 
-The system analyses images and videos to identify motorcycles, riders, helmet usage, and multiple riders on a motorcycle.
+Every violation is saved as an annotated evidence image and a database record, and the
+number plate of the offending motorcycle can be read automatically.
 
-It aims to help identify unsafe riding behaviour and improve awareness of road safety.
+> **Prototype.** Built for learning and demonstration. It is not an official
+> law-enforcement system; see [Responsible use](#responsible-use).
 
-## Objectives
+![Triple riding detection](screenshots/triple_2_annotated.jpg)
 
-- Detect motorcycles and people in images and videos.
-- Identify riders wearing helmets and those without helmets.
-- Count the number of riders on a motorcycle.
-- Detect triple riding (three or more riders).
-- Display visual warnings for detected safety violations.
-- Save annotated images, videos, and evidence.
+## Features
 
-## Technologies Used
+| | |
+|---|---|
+| **Detection** | Motorcycles (YOLO11), riders (YOLO11-Pose), helmets (custom-trained YOLO11n) |
+| **Tracking** | ByteTrack gives every motorcycle a stable ID, so one violator is counted once |
+| **Rider counting** | Each person is assigned to a bike by their seat (hip) position; hidden pillions are recovered from head detections |
+| **Smoothing** | Rider counts use a median over recent frames, so one bad frame cannot trigger a violation |
+| **Number plates** | Optional plate detector + EasyOCR with Indian plate-format correction |
+| **Evidence** | Annotated image per violation, with a cool-down so the same bike is not saved repeatedly |
+| **Database** | SQLite log of every violation (`outputs/violations.db`), exportable to CSV |
+| **Inputs** | Video file, photo(s), webcam, CCTV / RTSP stream, phone camera (IP-camera app) |
+| **Interfaces** | Streamlit dashboard, command-line tools, interactive photo tester |
 
-- Python
-- OpenCV
-- Ultralytics YOLO
-- YOLO11m (vehicle detection in the main application)
-- YOLO11n (vehicle detection in the separate video script)
-- YOLO11n-Pose
-- Custom-trained YOLO11n helmet detection model
-- Visual Studio Code
+## Quick start
 
-## Main Features
+Requires **Python 3.10+**. An NVIDIA GPU is optional but makes video much faster.
 
-### 1. Helmet Detection
-Identifies whether a rider is wearing a helmet or not.
+```bash
+git clone https://github.com/khushi-149/two-wheeler-safety-detection.git
+cd two-wheeler-safety-detection
 
-### 2. Rider Detection
-Detects people and associates them with motorcycles using object detection and pose information.
+python -m venv venv
+# Windows PowerShell:  .\venv\Scripts\Activate.ps1
+# macOS / Linux:       source venv/bin/activate
 
-### 3. Triple-Riding Detection
-Counts riders associated with a motorcycle and flags cases involving three or more riders.
-
-### 4. Photo Testing
-Allows users to select an image and analyse it for safety violations.
-
-### 5. Video Testing
-Processes video files and displays detection results with visual annotations.
-
-### 6. Output and Evidence
-Saves annotated images and processed videos for reviewing detection results.
-
-## Project Structure
-
-```text
-two-wheeler-safety/
-│
-├── data/
-│   ├── helmet_dataset/
-│   ├── test_images/
-│   └── videos/
-│
-├── models/
-│   └── helmet_detector.pt
-│
-├── outputs/
-│   ├── evidence/
-│   └── videos/
-│
-├── runs/
-│   ├── test_images/
-│   └── videos/
-│
-├── src/
-│   ├── detect_video.py
-│   ├── rider_association.py
-│   ├── test_riders.py
-│   ├── test_yolo.py
-│   └── train_helmet.py
-│
-├── eval/
-├── requirements.txt
-├── README.md
-├── yolo11n.pt
-└── yolo11n-pose.pt
+pip install -r requirements.txt
 ```
 
-## Helmet Detection Model
+Download **`helmet_detector.pt`** from this repository's *Releases* page and put it in
+`models/`. Official YOLO weights (`yolo11n.pt`, `yolo11n-pose.pt`) download automatically on
+first use. Then verify the setup:
 
-A custom helmet detection model was trained using a YOLO-compatible dataset.
+```bash
+python scripts/check_setup.py
+```
 
-**Training configuration:**
-- Model: YOLO11n
-- Epochs: 30
-- Image size: 640
-- Batch size: 16
-- Training platform: Google Colab with GPU
+## Usage
 
-**Dataset classes:**
-- With Helmet
-- Without Helmet
+### Dashboard (recommended)
 
-### Model Evaluation Results
+```bash
+streamlit run src/dashboard.py
+```
+
+Pick an input source in the sidebar, press **Start**, and watch live counters and violations.
+The **Results** tab shows the processed video/photo, violations, plates and evidence for each
+run; **History** lists everything ever logged and exports CSV.
+
+### Command line
+
+```bash
+python src/detect_video_full.py                      # menu of videos in data/videos
+python src/detect_video_full.py clip.mp4 photo.jpg   # process specific files
+python src/detect_video_full.py clip.mp4 --no-preview --no-plates   # fastest
+python src/detect_webcam.py 0 --record               # webcam 0, save the annotated video
+python src/detect_webcam.py "http://192.168.1.5:8080/video"   # phone / IP camera
+```
+
+Add `-v` for detailed progress logging. Press **Q** in a preview window to stop.
+
+### Interactive photo tester
+
+```bash
+python src/interactive_tester.py
+```
+
+Menu-driven tool for single photos in `data/test_images/` using a heavier full-frame method
+with extra helmet re-checks. You can enter the expected rider count to compare with the result.
+
+### Train the helmet model
+
+```bash
+python src/train_helmet.py --epochs 30 --device 0
+```
+
+Or run `notebooks/helmet_detection_training.ipynb` on Google Colab. See `data/README.md` for the dataset.
+
+### Train the number-plate detector (needed for plate reading)
+
+Plate reading stays off until `models/plate_detector.pt` exists. Train it on Google Colab with
+`notebooks/plate_detection_training.ipynb`: download a licence-plate dataset from Roboflow Universe
+(YOLOv8 format, check its licence), upload the zip in the notebook, run all cells, and copy the
+downloaded `plate_detector.pt` into `models/`. Plates are only read for bikes with a violation.
+
+## Project structure
+
+```text
+two-wheeler-safety-detection/
+├── src/
+│   ├── settings.py            all thresholds and folder locations (edit here)
+│   ├── pipeline.py            main pipeline: track -> riders -> helmets -> plates -> evidence
+│   ├── assignment.py          which person rides which bike, which head belongs to whom
+│   ├── rider_association.py   full-frame association, duplicate removal, triple-riding rule
+│   ├── rider_tracking.py      ByteTrack wrapper for motorcycles
+│   ├── plate_reader.py        plate detection + OCR + background worker
+│   ├── violation_db.py        SQLite violation log
+│   ├── capture.py             photo / camera / stream input
+│   ├── drawing.py             annotation helpers
+│   ├── geometry.py            box maths (IoU, centres, ...)
+│   ├── stream_server.py       local MJPEG server for smooth live view in the dashboard
+│   ├── video_menu.py          video / camera pickers
+│   ├── dashboard.py           Streamlit app
+│   ├── detect_video_full.py   CLI: videos and photos
+│   ├── detect_webcam.py       CLI: webcam and streams
+│   ├── interactive_tester.py  menu-driven photo / video tester
+│   └── train_helmet.py        CLI: train the helmet detector (also works for other YOLO datasets)
+├── tests/                     automated tests (pytest)
+├── scripts/check_setup.py     environment diagnostics
+├── notebooks/                 Colab notebooks: helmet and number-plate training
+├── models/                    model weights (not in git)
+├── data/                      videos, photos, dataset (not in git)
+├── outputs/                   evidence, processed videos, plates, database (not in git)
+├── eval/                      helmet model evaluation plots
+└── screenshots/               example results
+```
+
+## How it works
+
+1. **Track** motorcycles with YOLO11 + ByteTrack, so each bike keeps one ID.
+2. **Crop** the area around each bike (including the space above it where riders sit).
+3. **Detect** people with pose estimation and heads with the helmet model on that crop.
+4. **Assign** each person to the bike their hips are on; assign each head to its rider;
+   treat a head with no body above a bike as a hidden pillion.
+5. **Smooth** the rider count over the last few analyses of that bike.
+6. **Decide**: any *Without Helmet* head -> helmet violation; 3+ riders -> triple riding.
+7. **Record**: save the annotated frame, log it in SQLite, and read the plate in a background
+   thread so the video never stalls.
+
+To keep video fast, each bike is re-analysed every 3rd frame while tracking runs on every frame.
+All of this is tunable in `src/settings.py`.
+
+## Output
+
+| Location | Content |
+|---|---|
+| `outputs/evidence/` | Annotated frame for each violation |
+| `outputs/videos/` | Annotated videos |
+| `outputs/images/` | Annotated photos |
+| `outputs/plates/` | Cropped number plates |
+| `outputs/violations.db` | SQLite table `violations` (run, bike ID, type, time, evidence path, plate) |
+
+## Helmet model
+
+Custom YOLO11n trained on Google Colab (30 epochs, 640 px, batch 16) on the Roboflow
+*Helmet Detection_YOLOv8 - With and Without Helmet* dataset (4,169 images, CC BY 4.0; see
+`data/README.md`). Classes: **With Helmet**, **Without Helmet**.
 
 | Metric | Validation | Test |
 |---|---:|---:|
@@ -107,90 +169,71 @@ A custom helmet detection model was trained using a YOLO-compatible dataset.
 | mAP50 | 0.927 | 0.919 |
 | mAP50-95 | 0.593 | 0.582 |
 
+Confusion matrix, PR/F1 curves and sample predictions are in `eval/helmet_evaluation/`.
+
 ## Testing
 
-The system was tested using multiple images and video files.
-
-Testing included:
-- Riders wearing helmets.
-- Riders without helmets.
-- Multiple riders on one motorcycle.
-- Triple-riding scenarios.
-- Traffic videos with multiple motorcycles.
-
-The photo and video tests produced correct results in the tested cases, based on visual verification.
-
-## How to Run
-
-### 1. Clone the repository
-
 ```bash
-git clone https://github.com/khushi-149/two-wheeler-safety-detection.git
-cd two-wheeler-safety-detection
+pip install -r requirements-dev.txt
+pytest
 ```
 
-### 2. Create a virtual environment
+The tests run without GPU, model weights or PyTorch: they use scripted stand-in models and
+real image / video files to check rider counting, smoothing, evidence saving, the database,
+plate-text correction and credential redaction end to end. They also run in CI on every push.
 
-```bash
-python -m venv venv
-```
+Beyond the automated tests, the system was checked visually on photos and traffic videos
+covering helmeted riders, riders without helmets, double riding, triple riding and busy
+multi-motorcycle scenes.
 
-### 3. Activate the environment (Windows PowerShell)
+## Configuration
 
-```powershell
-.\venv\Scripts\Activate.ps1
-```
-
-### 4. Install dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### 5. Run the detection system
-
-```bash
-python src/test_riders.py
-```
-
-Select Photo Testing or Video Testing from the main menu.
+Everything tunable is in `src/settings.py`: confidence thresholds, evidence cool-down,
+analysis frequency, rider-assignment margins, and folder locations. Paths are relative to the
+project root, so scripts work from any directory.
 
 ## Limitations
 
-- Detection accuracy can vary depending on image quality, lighting, camera angle, and occlusion.
-- Rider-to-motorcycle association may be challenging in crowded traffic scenes.
-- Low-confidence helmet detections may require further review.
-- The system is a prototype and should not be treated as an official law-enforcement system.
+- Accuracy depends on image quality, lighting, camera angle and occlusion.
+- Rider assignment is harder in dense traffic where bikes overlap.
+- Helmet detections of low confidence may need human review.
+- Plate reading needs a separate plate-detector model (`models/plate_detector.pt`); without it
+  plate reading is switched off.
+- The dashboard shares one set of models between sessions, so run one analysis at a time.
 
-## Future Improvements
+## Troubleshooting
 
-- Improve rider-to-motorcycle association.
-- Add object tracking across video frames.
-- Improve helmet detection in crowded scenes.
-- Develop a real-time camera-based monitoring interface.
+| Problem | Fix |
+|---|---|
+| `Helmet model not found` | Put `helmet_detector.pt` in `models/` (see `models/README.md`) |
+| `Missing dependency` | `pip install -r requirements.txt` |
+| No preview window / OpenCV GUI error | You have a headless OpenCV build; the program continues without a window |
+| Webcam not found | Close other apps using it, or try another index (`python src/detect_webcam.py 1`) |
+| Processed video does not play in the dashboard | `pip install imageio-ffmpeg`, or open the file from `outputs/videos/` |
+| Very slow on CPU | Use `--no-preview --no-plates`, or raise `ANALYZE_EVERY` in `settings.py` |
 
-## Conclusion
+## Responsible use
 
-This project demonstrates how computer vision and YOLO object detection can be used to identify two-wheeler safety violations, including helmet-related violations and triple riding.
+This project processes video of real people and can store images and number plates, which are
+personal data. Use it only where you have the right to record, follow your local privacy and
+traffic laws, keep evidence only as long as needed, and have a human review any detection
+before it is acted on. Detections are statistical and can be wrong.
 
-It combines object detection, pose estimation, rider association, image processing, and video analysis into one system.
+## Results gallery
 
-## Detection Results
+**Double riding**
 
-### Double-Rider Detection
+![Double rider detection](screenshots/double_1_annotated.jpg)
 
-![Double Rider Detection](screenshots/double_1_annotated.jpg)
+**Triple riding with helmet detection**
 
-### Triple-Riding and Helmet Detection
+![Triple riding example 1](screenshots/triple_2_annotated.jpg)
+![Triple riding example 2](screenshots/triple_3_annotated.jpg)
+![Triple riding example 3](screenshots/triple_4_annotated.jpg)
 
-**Test 1**
+## Acknowledgements
 
-![Triple Test 2](screenshots/triple_2_annotated.jpg)
-
-**Test 2**
-
-![Triple Test 3](screenshots/triple_3_annotated.jpg)
-
-**Test 3**
-
-![Triple Test 4](screenshots/triple_4_annotated.jpg)
+[Ultralytics YOLO](https://github.com/ultralytics/ultralytics) - detection, pose, tracking ·
+[EasyOCR](https://github.com/JaidedAI/EasyOCR) - plate text ·
+[Streamlit](https://streamlit.io) - dashboard ·
+Helmet dataset by *learning-evidence* on [Roboflow Universe](https://universe.roboflow.com/learning-evidence/helmet-detection_yolov8) (CC BY 4.0).

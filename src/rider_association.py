@@ -1,7 +1,11 @@
 """Helpers for associating people with motorcycles and detecting triple riding."""
 
-import math
+from __future__ import annotations
 
+import math
+from typing import Optional, Sequence
+
+from geometry import box_area, iou  # noqa: F401  (re-exported for older imports)
 
 # -------------------- Tunable settings --------------------
 
@@ -17,36 +21,16 @@ MIN_HEIGHT_RATIO = 0.50
 TRIPLE_THRESHOLD = 3
 
 
-# -------------------- Geometry helpers --------------------
+# -------------------- Keypoints --------------------
 
-def iou(a, b):
-    """Calculate intersection-over-union for two xyxy boxes."""
-    ax1, ay1, ax2, ay2 = map(float, a)
-    bx1, by1, bx2, by2 = map(float, b)
-
-    ix1 = max(ax1, bx1)
-    iy1 = max(ay1, by1)
-    ix2 = min(ax2, bx2)
-    iy2 = min(ay2, by2)
-
-    intersection = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-
-    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
-    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
-
-    union = area_a + area_b - intersection
-    return intersection / union if union > 0 else 0.0
-
-
-def box_area(box):
-    x1, y1, x2, y2 = map(float, box)
-    return max(0, x2 - x1) * max(0, y2 - y1)
-
-
-def head_from_keypoints(points, confidences=None, min_conf=HEAD_KEYPOINT_CONF):
+def head_from_keypoints(
+    points: Optional[Sequence[Sequence[float]]],
+    confidences: Optional[Sequence[float]] = None,
+    min_conf: float = HEAD_KEYPOINT_CONF,
+) -> Optional[tuple[float, float]]:
     """
-    Estimate head centre from COCO keypoints:
-    nose=0, eyes=1-2, ears=3-4.
+    Estimate the head centre from COCO keypoints
+    (nose=0, eyes=1-2, ears=3-4). Returns ``None`` if no keypoint is reliable.
     """
     if points is None:
         return None
@@ -67,17 +51,17 @@ def head_from_keypoints(points, confidences=None, min_conf=HEAD_KEYPOINT_CONF):
         return None
 
     return (
-        sum(point[0] for point in valid) / len(valid),
-        sum(point[1] for point in valid) / len(valid),
+        sum(p[0] for p in valid) / len(valid),
+        sum(p[1] for p in valid) / len(valid),
     )
 
 
-def head_point(person):
-    """Get a person's head point, falling back to the top-centre of the box."""
+def head_point(person: dict) -> tuple[float, float]:
+    """A person's head point, falling back to the top of their box."""
     head = person.get("head")
 
     if head is not None:
-        return tuple(map(float, head))
+        return (float(head[0]), float(head[1]))
 
     x1, y1, x2, y2 = map(float, person["box"])
     return ((x1 + x2) / 2, y1 + (y2 - y1) * 0.08)
@@ -85,35 +69,28 @@ def head_point(person):
 
 # -------------------- Duplicate removal --------------------
 
-def dedupe_motorcycles(motorcycles, thresh=MOTO_MERGE_IOU):
-    """Remove highly overlapping duplicate motorcycle detections."""
-    kept = []
+def dedupe_motorcycles(motorcycles: list[dict], thresh: float = MOTO_MERGE_IOU) -> list[dict]:
+    """Remove highly overlapping duplicate motorcycle detections (keeps the most confident)."""
+    kept: list[dict] = []
 
-    for moto in sorted(motorcycles, key=lambda item: item.get("conf", 0), reverse=True):
+    for moto in sorted(motorcycles, key=lambda m: m.get("conf", 0), reverse=True):
         if not any(iou(moto["box"], old["box"]) >= thresh for old in kept):
             kept.append(moto)
 
     return kept
 
 
-def dedupe_people(people):
+def dedupe_people(people: list[dict]) -> list[dict]:
     """
-    Remove duplicate person detections.
-    Avoid merging people solely because their head points are close.
+    Remove duplicate person detections (near-identical boxes).
+
+    People are NOT merged just because their heads are close: two riders on
+    one bike legitimately overlap a lot.
     """
-    kept = []
+    kept: list[dict] = []
 
-    for person in sorted(people, key=lambda item: item.get("conf", 0), reverse=True):
-        duplicate = False
-
-        for old in kept:
-            overlap = iou(person["box"], old["box"])
-
-            if overlap >= BOX_DUP_IOU:
-                duplicate = True
-                break
-
-        if not duplicate:
+    for person in sorted(people, key=lambda p: p.get("conf", 0), reverse=True):
+        if all(iou(person["box"], old["box"]) < BOX_DUP_IOU for old in kept):
             kept.append(person)
 
     return kept
@@ -121,18 +98,16 @@ def dedupe_people(people):
 
 # -------------------- Rider association --------------------
 
-def associate_riders(people, motorcycles):
+def associate_riders(people: list[dict], motorcycles: list[dict]) -> dict[int, list[int]]:
     """
     Associate each detected person with at most one motorcycle.
 
-    Input:
-      people: [{"box": [x1,y1,x2,y2], "head": (x,y), "conf": 0.9}, ...]
-      motorcycles: [{"box": [x1,y1,x2,y2], "conf": 0.9}, ...]
+    people:      [{"box": [x1,y1,x2,y2], "head": (x,y), "conf": 0.9}, ...]
+    motorcycles: [{"box": [x1,y1,x2,y2], "conf": 0.9}, ...]
 
-    Output:
-      {motorcycle_index: [person_index, ...]}
+    Returns ``{motorcycle_index: [person_index, ...]}``.
     """
-    associations = {index: [] for index in range(len(motorcycles))}
+    associations: dict[int, list[int]] = {i: [] for i in range(len(motorcycles))}
 
     for person_index, person in enumerate(people):
         px1, py1, px2, py2 = map(float, person["box"])
@@ -141,17 +116,15 @@ def associate_riders(people, motorcycles):
         if person_height <= 0:
             continue
 
-        # Use the lower-body position as the association point.
+        # The lower-body point is used as the association point.
         foot_x = (px1 + px2) / 2
         foot_y = py2 - person_height * LOWER_BODY_FRACTION
 
-        best_moto = None
-        best_score = 0.0
+        best_moto, best_score = None, 0.0
 
         for moto_index, moto in enumerate(motorcycles):
             mx1, my1, mx2, my2 = map(float, moto["box"])
-            moto_height = my2 - my1
-            moto_width = mx2 - mx1
+            moto_height, moto_width = my2 - my1, mx2 - mx1
 
             if moto_height <= 0 or moto_width <= 0:
                 continue
@@ -163,21 +136,16 @@ def associate_riders(people, motorcycles):
             ex1 = mx1 - moto_width * MOTO_EXPAND_SIDE
             ex2 = mx2 + moto_width * MOTO_EXPAND_SIDE
             ey1 = my1 - moto_height * MOTO_EXPAND_UP
-            ey2 = my2
 
-            if not (ex1 <= foot_x <= ex2 and ey1 <= foot_y <= ey2):
+            if not (ex1 <= foot_x <= ex2 and ey1 <= foot_y <= my2):
                 continue
 
             # Prefer motorcycles whose box overlaps the lower part of the person.
             lower_box = [px1, py1 + person_height * 0.55, px2, py2]
-            score = iou(lower_box, [mx1, my1, mx2, my2])
-
-            # A small positive score allows valid point-in-region matches.
-            score += 0.001
+            score = iou(lower_box, [mx1, my1, mx2, my2]) + 0.001  # allow point-in-region matches
 
             if score > best_score:
-                best_score = score
-                best_moto = moto_index
+                best_moto, best_score = moto_index, score
 
         if best_moto is not None:
             associations[best_moto].append(person_index)
@@ -187,21 +155,14 @@ def associate_riders(people, motorcycles):
 
 # -------------------- Rider counting --------------------
 
-def count_riders(associations):
-    """Return the number of associated people for each motorcycle."""
-    return {
-        motorcycle_id: len(person_ids)
-        for motorcycle_id, person_ids in associations.items()
-    }
+def count_riders(associations: dict[int, list[int]]) -> dict[int, int]:
+    """Number of associated people for each motorcycle."""
+    return {moto_id: len(ids) for moto_id, ids in associations.items()}
 
 
-def detect_triple_riding(rider_counts):
-    """Flag motorcycles carrying three or more detected people."""
+def detect_triple_riding(rider_counts: dict[int, int]) -> dict[int, str]:
+    """Flag motorcycles carrying three or more people as ``"TRIPLE RIDING"``, else ``"OK"``."""
     return {
-        motorcycle_id: (
-            "TRIPLE RIDING"
-            if count >= TRIPLE_THRESHOLD
-            else "OK"
-        )
-        for motorcycle_id, count in rider_counts.items()
+        moto_id: "TRIPLE RIDING" if count >= TRIPLE_THRESHOLD else "OK"
+        for moto_id, count in rider_counts.items()
     }

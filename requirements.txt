@@ -1,9 +1,17 @@
+# Runtime dependencies. Install with:  pip install -r requirements.txt
+# (ultralytics pulls in PyTorch; for an NVIDIA GPU install the CUDA build of
+#  torch first, see https://pytorch.org/get-started/locally/)
 ultralytics>=8.3
-opencv-python
-pyyaml
-pandas
-numpy
-streamlit
-supervision>=0.32.0
+opencv-python>=4.8
+numpy>=1.24
+pandas>=2.0
+streamlit>=1.35
+
+# Tracking backend used by Ultralytics ByteTrack
+lap>=0.5.12
+
+# Number plate reading (optional; plate reading stays off without it)
 easyocr>=1.7.2
-lap>=0.5.12lap>=0.5.12
+
+# Play processed videos inside the dashboard (optional)
+imageio-ffmpeg>=0.4.9
