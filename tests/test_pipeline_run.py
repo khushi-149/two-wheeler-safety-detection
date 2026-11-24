@@ -12,6 +12,7 @@ import pipeline as pl
 from fakes import FakeHelmetModel, FakeTraffic, helmet_result, person_result
 
 BIKE = (200, 250, 400, 420)
+pl_BIKE = BIKE
 
 
 def make_riders(n):
@@ -391,3 +392,130 @@ def test_photo_without_violation_reads_no_plate(make_pipeline, tmp_path, monkeyp
     p.run(write_photo(tmp_path))
 
     assert p.plate_reader.calls == 0
+
+
+def test_realtime_file_playback_streams_frames_to_the_preview(make_pipeline, tmp_path):
+    p = make_pipeline(make_riders(2))
+    shown = []
+
+    stats = p.run(write_video(tmp_path, frames=30), realtime=True, save_video=False,
+                  display_callback=shown.append)
+
+    assert stats["frame"] >= 1
+    assert len(shown) >= 1                                # preview got frames
+    assert all(img.ndim == 3 for img in shown)
+
+
+def test_photos_use_more_sensitive_helmet_threshold_than_videos(make_pipeline):
+    import settings
+    p = make_pipeline(make_riders(1))
+
+    p.photo_mode = False
+    assert p._helmet_conf() == settings.HELMET_CONF
+
+    p.photo_mode = True
+    assert p._helmet_conf() == min(settings.HELMET_CONF, settings.PHOTO_HELMET_CONF)
+
+
+def test_photo_pose_model_is_loaded_once_and_only_for_photos(make_pipeline, monkeypatch):
+    p = make_pipeline(make_riders(1))
+    loaded = []
+    monkeypatch.setattr(pl, "YOLO", lambda path: loaded.append(path) or object())
+
+    p.photo_mode = False
+    assert p._active_pose() is p.pose_model and loaded == []
+
+    p.photo_mode = True
+    first = p._active_pose()
+    assert first is not p.pose_model and p._active_pose() is first
+    assert len(loaded) == 1 and loaded[0].endswith("yolo11m-pose.pt")
+
+
+def test_photo_pose_model_falls_back_when_it_cannot_be_loaded(make_pipeline, monkeypatch):
+    p = make_pipeline(make_riders(1))
+
+    def broken(path):
+        raise OSError("offline")
+
+    monkeypatch.setattr(pl, "YOLO", broken)
+    p.photo_mode = True
+
+    assert p._active_pose() is p.pose_model
+
+
+def test_photo_rider_without_found_head_gets_a_review_marker_not_a_violation(
+        make_pipeline, tmp_path, monkeypatch):
+    riders = make_riders(2)
+    p = make_pipeline(riders)
+    script_heads(p, monkeypatch, riders, [(0, 0, 0.9)])            # rider 2: no head found
+
+    class Nothing:
+        def __call__(self, crop, **kwargs):
+            return [Result(Boxes([]))]
+
+    p.helmet_model = Nothing()
+
+    stats = p.run(write_photo(tmp_path))
+    image = cv2.imread(stats["output_image"])
+    amber = np.all(image == (0, 140, 255), axis=2).sum()
+
+    assert stats["helmet_violations"] == 0 and p.db.fetch() == []
+    assert amber > 0                                               # visible for a human to check
+
+
+def test_video_never_shows_review_markers(make_pipeline, tmp_path, monkeypatch):
+    riders = make_riders(2)
+    p = make_pipeline(riders)
+    script_heads(p, monkeypatch, riders, [(0, 0, 0.9)])
+
+    class Nothing:
+        def __call__(self, crop, **kwargs):
+            return [Result(Boxes([]))]
+
+    p.helmet_model = Nothing()
+    seen = []
+
+    p.run(write_video(tmp_path, frames=6), save_video=False,
+          frame_callback=lambda img, st: seen.append(np.all(img == (0, 140, 255), axis=2).sum()),
+          callback_every=1)
+
+    assert seen and sum(seen) == 0
+
+
+def test_debug_photo_report_explains_riders_heads_and_rejections(make_pipeline, monkeypatch):
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import debug_photo
+
+    riders = make_riders(2)
+    steps_sitter = {"box": [20, 20, 90, 120], "head": (50, 40), "hip": (55, 100)}   # far from the bike
+    p = make_pipeline(riders + [steps_sitter], no_helmet_index=1)
+    frame = np.zeros((480, 640, 3), np.uint8)
+
+    text = "\n".join(debug_photo.describe(p, frame, [{"box": list(pl_BIKE), "conf": 0.9}]))
+
+    assert "MOTORCYCLE 0" in text and "2 rider(s)" in text
+    assert "Without Helmet" in text and "With Helmet" in text
+    assert text.count("RIDER") >= 2
+
+
+def test_photo_head_recheck_uses_a_larger_size_than_video(make_pipeline, tmp_path, monkeypatch):
+    import settings
+    sizes = []
+
+    class Recorder:
+        def __call__(self, crop, **kwargs):
+            sizes.append(kwargs.get("imgsz"))
+            return [Result(Boxes([]))]
+
+    for photo in (True, False):
+        riders = make_riders(1)
+        p = make_pipeline(riders)
+        script_heads(p, monkeypatch, riders, [])           # rider without a head -> re-check runs
+        p.helmet_model = Recorder()
+        p.photo_mode = photo
+        p._refine_heads(np.zeros((480, 640, 3), np.uint8), riders,
+                        {0: [r["box"] for r in riders]}, [], [], [0])
+
+    assert sizes == [settings.RECOVERY_IMGSZ_PHOTO, settings.RECOVERY_IMGSZ]

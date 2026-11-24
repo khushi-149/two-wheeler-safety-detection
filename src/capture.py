@@ -82,6 +82,7 @@ class ThreadedCapture:
         self._frame = None
         self._seq = 0
         self._last_seq = 0
+        self.last_read_seq = 0          # seq of the frame the last read() returned
         self._index = 0
         self._ended = False
         self._running = self.cap.isOpened()
@@ -190,6 +191,7 @@ class ThreadedCapture:
             with self._lock:
                 if self._frame is not None and self._seq != self._last_seq:
                     self._last_seq = self._seq
+                    self.last_read_seq = self._seq
                     return True, self._frame.copy()
 
                 if self._ended:

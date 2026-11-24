@@ -158,6 +158,18 @@ SEAT_MARGIN_BOTTOM = 0.10
 MAX_HEAD_ABOVE_MOTO = 0.80
 MAX_HEAD_ABOVE_PERSON = 0.50
 
+# Scale check: someone far in the background (a pedestrian, a stall visitor)
+# looks tiny next to the bike. A rider's box is at least this share of the
+# bike's height, and a "hidden pillion" head (a head with no body found) must be
+# at least this share of the bike's height AND of the riders' own heads.
+MIN_PERSON_TO_BIKE = 0.30
+MIN_HIDDEN_HEAD_TO_BIKE = 0.12
+MIN_HIDDEN_HEAD_VS_RIDERS = 0.50
+
+# A rider's body overlaps the bike (legs / seat). Someone whose box barely
+# touches it (sitting on steps behind a parked bike) is a bystander.
+MIN_RIDER_BODY_OVERLAP = 0.10
+
 # Fallback: a person counts as a rider if at least this share of the person
 # box overlaps the motorcycle box.
 MIN_RIDER_OVERLAP = 0.10
@@ -189,6 +201,7 @@ EXPAND_BOTTOM = 0.0
 # doubtful "With Helmet" (hair, turbans, scarves score low).
 RECOVERY_CONF = 0.10
 RECOVERY_IMGSZ = 320
+RECOVERY_IMGSZ_PHOTO = 640     # photos: look at the zoomed head in more detail
 
 VERIFY_ENABLED = True
 VERIFY_BELOW = 0.75         # re-check a "With Helmet" scoring below this
@@ -198,6 +211,23 @@ VERIFY_WITHOUT_MIN = 0.30   # the re-check must say "Without" at least this sure
 # False (default) = leave them unflagged, so a helmeted rider the model cannot
 # see never causes a false violation. True = flag them (the photo tester does).
 INFER_NO_HELMET = False
+
+# -------------------- Photos: extra accuracy (speed does not matter) --------------------
+
+# Photos are analysed once, so they can use a stronger person/pose model (it
+# finds partly hidden pillions much better) and a lower helmet confidence.
+# The bigger model downloads automatically the first time. "" = off.
+POSE_MODEL_PHOTO = "yolo11m-pose.pt"
+PHOTO_HELMET_CONF = 0.25
+
+# -------------------- Smooth video playback --------------------
+
+# Real-time playback of a video FILE: show the video slightly delayed so each
+# frame is drawn together with the detections made ON that frame (boxes stay
+# glued to the riders). The delay adapts to how fast your computer is.
+ALIGNED_FILE_DISPLAY = True
+DISPLAY_MIN_DELAY = 0.35      # seconds
+DISPLAY_MAX_DELAY = 2.0
 
 # -------------------- Plates --------------------
 

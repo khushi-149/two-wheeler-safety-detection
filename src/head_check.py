@@ -15,6 +15,10 @@ import cv2
 from rider_association import head_point
 
 
+# class id of a head marker that means "a rider is here but no helmet verdict could be made"
+UNKNOWN_HEAD = -1
+
+
 def head_crop_detections(helmet_model, frame, person, conf, imgsz):
     """
     Run the helmet model on a small crop around the person's head (upscaled

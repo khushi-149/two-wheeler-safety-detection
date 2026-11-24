@@ -62,3 +62,34 @@ photo and one video on your machine before relying on it.
 - **`INFER_NO_HELMET`** (default False): set True to flag riders whose head is not found at all.
 - Plates are read only for violating bikes and need `models/plate_detector.pt`.
 - Tested with scripted fake models only; not yet verified against the real weights.
+
+## Cleaner labels and rider count
+
+- Labels are sized as a share of the picture (no more giant text on 4000 px photos), drawn as small
+  non-overlapping chips that stay inside the picture, and placed BELOW the bike so they no longer
+  cover the riders' heads. One compact "NO HELMET VIOLATION / TRIPLE RIDING DETECTED" banner.
+- Rider count: tiny people far behind the bike (stall visitors, pedestrians) are no longer counted
+  as riders or "hidden pillions" (`MIN_PERSON_TO_BIKE`, `MIN_HIDDEN_HEAD_TO_BIKE`,
+  `MIN_HIDDEN_HEAD_VS_RIDERS` in settings.py).
+
+## Smooth, aligned video preview + photo accuracy
+
+- **Video preview (`src/display.py`, new):** a video FILE in real-time mode is now shown slightly
+  delayed (adapts to your PC's detection speed, 0.35-2 s) so each frame is drawn with the detections
+  made on that frame. Boxes stay on the riders instead of trailing behind. Settings:
+  `ALIGNED_FILE_DISPLAY`, `DISPLAY_MIN_DELAY`, `DISPLAY_MAX_DELAY`. Cameras keep the lowest-latency view.
+- **Bystanders:** a person whose body barely overlaps the bike (sitting on steps behind a parked bike)
+  is not a rider (`MIN_RIDER_BODY_OVERLAP`).
+- **Photos only:** stronger pose model `yolo11m-pose.pt` (downloads on first photo; finds hidden
+  pillions) and a lower helmet confidence (`PHOTO_HELMET_CONF`). A rider whose head cannot be found
+  gets an amber "HELMET NOT FOUND" marker for a human to check. It is NOT logged as a violation
+  (set `INFER_NO_HELMET = True` to log such riders as "no helmet").
+- **`scripts/debug_photo.py` (new):** prints every person / head the pipeline sees on a photo and why each
+  was or was not counted.
+
+## Head-to-rider matching fix (crowded riders)
+
+- Heads are now matched to riders globally by distance to each rider's pose head point, instead of
+  rider-by-rider. Fixes the "4 riders" on triple_3.jpg, where the rear rider took the middle rider's
+  helmet and left the rear rider's own helmet over as a phantom "hidden pillion".
+- `scripts/debug_photo.py` now also runs the zoomed head re-check, so its output matches the dashboard.

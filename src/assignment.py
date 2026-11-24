@@ -12,6 +12,8 @@ from settings import (
     HEAD_TOP_ALLOWANCE, HEAD_ZONE,
     HIDDEN_BELOW, HIDDEN_SIDE, HIDDEN_TOP,
     MAX_HEAD_ABOVE_MOTO, MAX_HEAD_ABOVE_PERSON,
+    MIN_HIDDEN_HEAD_TO_BIKE, MIN_HIDDEN_HEAD_VS_RIDERS, MIN_PERSON_TO_BIKE,
+    MIN_RIDER_BODY_OVERLAP,
     MIN_HISTORY_FOR_TRIPLE, MIN_RIDER_OVERLAP,
     SEAT_MARGIN_BOTTOM, SEAT_MARGIN_SIDE, SEAT_MARGIN_TOP,
 )
@@ -129,6 +131,18 @@ def is_plausible_rider(person, moto):
     moto_height = max(moto["box"][3] - moto["box"][1], 1.0)
     person_height = max(person["box"][3] - person["box"][1], 1.0)
 
+    if person_height < MIN_PERSON_TO_BIKE * moto_height:
+        return False                                  # tiny = far-away bystander
+
+    # a rider's body overlaps the bike; a person sitting on steps behind it does not
+    px1, py1, px2, py2 = person["box"]
+    mx1, my1, mx2, my2 = moto["box"]
+    shared = (max(0.0, min(px2, mx2) - max(px1, mx1))
+              * max(0.0, min(py2, my2) - max(py1, my1)))
+
+    if shared < MIN_RIDER_BODY_OVERLAP * max((px2 - px1) * (py2 - py1), 1.0):
+        return False
+
     above = moto_top - head_point(person)[1]
 
     return not (
@@ -225,8 +239,27 @@ def _head_in_person(center, person_box):
     )
 
 
+def _hidden_head_is_believable(det, moto, known_heads):
+    """
+    A head with no body must be about as big as the riders' heads. A much
+    smaller head belongs to someone far behind the bike, not to a pillion.
+    """
+    head_h = det["box"][3] - det["box"][1]
+    bike_h = max(moto["box"][3] - moto["box"][1], 1.0)
+
+    if head_h < MIN_HIDDEN_HEAD_TO_BIKE * bike_h:
+        return False
+
+    sizes = sorted(d["box"][3] - d["box"][1] for d in known_heads)
+
+    if sizes and head_h < MIN_HIDDEN_HEAD_VS_RIDERS * sizes[len(sizes) // 2]:
+        return False
+
+    return True
+
+
 def assign_heads_to_bikes(helmet_dets, motorcycles, rider_boxes, other_boxes,
-                          claims=None):
+                          claims=None, people=None):
     """
     Decide which bike (if any) each detected head belongs to.
 
@@ -242,37 +275,46 @@ def assign_heads_to_bikes(helmet_dets, motorcycles, rider_boxes, other_boxes,
 
     If a list is passed as ``claims`` it is filled with (rider body box,
     detection) pairs, so the caller can tell which riders have no head yet.
+    If ``people`` is passed, their pose head points are used to match heads.
     """
     owners = []
     claimed = set()
 
-    # 1. Each rider's body claims ONE head: the one nearest the top-centre
-    #    of the body box. Any other head in that zone is a second person.
+    # 1. Match riders and heads GLOBALLY: every (rider, head) pair that fits is
+    #    scored by how far the head is from where the rider's head should be
+    #    (the pose model's head point; else the top-centre of the body box), and
+    #    the best pairs are taken first. Each rider gets one head, each head one
+    #    rider, so riders standing close together can no longer steal each
+    #    other's helmets. Any other head in the zone is a second person.
+    head_of_body = {tuple(p["box"]): head_point(p) for p in (people or [])}
+    pairs = []
+
     for idx, boxes in rider_boxes.items():
         for body in boxes:
+            body_h = max(body[3] - body[1], 1.0)
+            target = head_of_body.get(tuple(body)) or (
+                (body[0] + body[2]) / 2.0, body[1] + 0.10 * body_h)
 
-            candidates = [
-                (i, det) for i, det in enumerate(helmet_dets)
-                if i not in claimed
-                and _head_in_person(box_center(det["box"]), body)
-            ]
+            for i, det in enumerate(helmet_dets):
+                cx, cy = box_center(det["box"])
 
-            if not candidates:
-                continue
+                if _head_in_person((cx, cy), body):
+                    cost = (((cx - target[0]) ** 2 + (cy - target[1]) ** 2) ** 0.5) / body_h
+                    pairs.append((cost, idx, tuple(body), i))
 
-            target_x = (body[0] + body[2]) / 2.0
-            target_y = body[1] + 0.10 * (body[3] - body[1])
+    pairs.sort(key=lambda item: item[0])
+    done_bodies = set()
 
-            def distance(item):
-                cx, cy = box_center(item[1]["box"])
-                return (cx - target_x) ** 2 + (cy - target_y) ** 2
+    for cost, idx, body, i in pairs:
+        if i in claimed or (idx, body) in done_bodies:
+            continue
 
-            i, det = min(candidates, key=distance)
-            claimed.add(i)
-            owners.append((det, idx, False))
+        claimed.add(i)
+        done_bodies.add((idx, body))
+        owners.append((helmet_dets[i], idx, False))
 
-            if claims is not None:
-                claims.append((body, det))
+        if claims is not None:
+            claims.append((list(body), helmet_dets[i]))
 
     # 2-4. Heads nobody claimed
     for i, det in enumerate(helmet_dets):
@@ -314,7 +356,8 @@ def assign_heads_to_bikes(helmet_dets, motorcycles, rider_boxes, other_boxes,
             if dist < best_dist:
                 best_dist, best_idx = dist, idx
 
-        if best_idx is not None:
+        if best_idx is not None and _hidden_head_is_believable(
+                det, motorcycles[best_idx], [d for d, i, _ in owners if i == best_idx]):
             owners.append((det, best_idx, True))
 
     return owners
