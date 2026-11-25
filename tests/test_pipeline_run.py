@@ -135,6 +135,16 @@ def test_video_triple_riding_needs_agreement_then_is_logged_once(make_pipeline, 
     cap.release()
 
 
+def test_frame_stride_analyses_every_nth_frame_but_reports_source_position(make_pipeline, tmp_path):
+    p = make_pipeline(make_riders(3))
+
+    stats = p.run(write_video(tmp_path, frames=30), frame_stride=3)
+
+    assert stats["frames_analysed"] == 10                 # 3x fewer frames analysed
+    assert stats["frame"] == 30                           # progress is in source frames
+    assert stats["triple_riding"] == 1                    # still finds the violation
+
+
 def test_video_too_short_for_agreement_does_not_flag_triple(make_pipeline, tmp_path):
     p = make_pipeline(make_riders(3))
 
@@ -382,7 +392,21 @@ def test_photo_violator_plate_is_read_and_logged(make_pipeline, tmp_path, monkey
     assert [r["plate_number"] for r in p.db.fetch()] == ["HR26DK8337"]
 
 
-def test_photo_without_violation_reads_no_plate(make_pipeline, tmp_path, monkeypatch):
+def test_photo_without_violation_reads_plate_by_default(make_pipeline, tmp_path, monkeypatch):
+    riders = make_riders(1)
+    p = make_pipeline(riders)
+    script_heads(p, monkeypatch, riders, [(0, 0, 0.9)])
+    p.plate_reader = FixedPlateReader()
+
+    p.run(write_photo(tmp_path))
+
+    assert p.plate_reader.calls == 1
+
+
+def test_photo_without_violation_skips_plate_when_switched_off(make_pipeline, tmp_path, monkeypatch):
+    import settings
+
+    monkeypatch.setattr(settings, "READ_PLATES_IN_PHOTOS", False)
     riders = make_riders(1)
     p = make_pipeline(riders)
     script_heads(p, monkeypatch, riders, [(0, 0, 0.9)])
@@ -391,3 +415,78 @@ def test_photo_without_violation_reads_no_plate(make_pipeline, tmp_path, monkeyp
     p.run(write_photo(tmp_path))
 
     assert p.plate_reader.calls == 0
+
+
+def test_rider_with_visible_face_and_no_head_found_is_flagged(make_pipeline, tmp_path, monkeypatch):
+    riders = make_riders(2)
+    riders[1]["face"] = 3                                          # nose + both eyes clearly seen
+    p = make_pipeline(riders)
+    script_heads(p, monkeypatch, riders, [(0, 0, 0.9)])            # rider 2: no head box found
+
+    class Nothing:
+        def __call__(self, crop, **kwargs):
+            return [Result(Boxes([]))]
+
+    p.helmet_model = Nothing()
+
+    assert p.run(write_photo(tmp_path))["helmet_violations"] == 1
+
+
+def test_rider_seen_from_behind_with_no_head_found_is_not_flagged(make_pipeline, tmp_path, monkeypatch):
+    riders = make_riders(2)
+    riders[1]["face"] = 0                                          # back of the head only
+    p = make_pipeline(riders)
+    script_heads(p, monkeypatch, riders, [(0, 0, 0.9)])
+
+    class Nothing:
+        def __call__(self, crop, **kwargs):
+            return [Result(Boxes([]))]
+
+    p.helmet_model = Nothing()
+
+    assert p.run(write_photo(tmp_path))["helmet_violations"] == 0
+
+
+def test_hidden_pillion_head_gets_the_zoomed_second_look(make_pipeline, tmp_path, monkeypatch):
+    riders = make_riders(1)
+    p = make_pipeline(riders)
+    own = {"box": [210, 95, 250, 135], "cls": 0, "conf": 0.9}
+    pillion = {"box": [260, 110, 300, 150], "cls": 0, "conf": 0.50}   # "with helmet", only 0.50 sure
+    monkeypatch.setattr(p, "_analyze_crops", lambda frame, bikes: (riders, [own, pillion]))
+    p.helmet_model = ZoomHelmet(cls=1, conf=0.70)                  # zoomed look: clearly without
+
+    assert p.run(write_photo(tmp_path))["helmet_violations"] == 1
+
+
+
+def test_weak_with_helmet_that_nothing_confirms_counts_as_no_helmet(make_pipeline, tmp_path, monkeypatch):
+    # a yellow cap / a baby: the helmet model says "With Helmet" at only 0.30
+    riders = make_riders(1)
+    p = make_pipeline(riders)
+    script_heads(p, monkeypatch, riders, [(0, 0, 0.30)])
+
+    class Nothing:
+        def __call__(self, crop, **kwargs):
+            return [Result(Boxes([]))]
+
+    p.helmet_model = Nothing()                                     # zoomed look: nothing at all
+
+    assert p.run(write_photo(tmp_path))["helmet_violations"] == 1
+
+
+def test_fairly_sure_with_helmet_is_kept(make_pipeline, tmp_path, monkeypatch):
+    riders = make_riders(1)
+    p = make_pipeline(riders)
+    script_heads(p, monkeypatch, riders, [(0, 0, 0.60)])           # a real helmet scored 0.58-0.85
+    p.helmet_model = ZoomHelmet(cls=0, conf=0.39)
+
+    assert p.run(write_photo(tmp_path))["helmet_violations"] == 0
+
+
+def test_weak_with_helmet_is_kept_when_the_zoomed_look_confirms_it(make_pipeline, tmp_path, monkeypatch):
+    riders = make_riders(1)
+    p = make_pipeline(riders)
+    script_heads(p, monkeypatch, riders, [(0, 0, 0.47)])
+    p.helmet_model = ZoomHelmet(cls=0, conf=0.70)                  # zoomed look: clearly a helmet
+
+    assert p.run(write_photo(tmp_path))["helmet_violations"] == 0

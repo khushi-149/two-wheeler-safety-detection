@@ -401,27 +401,54 @@ if source_type == "Video file":
     playback = st.sidebar.radio(
         "Playback",
         [
-            "Real-time (smooth video)",
-            "Process every frame (complete, plays at the end)",
+            "Live preview (every frame, recommended)",
+            "Real-time (skips frames, fast computer/GPU only)",
         ],
-        help="Real-time: the video plays at its normal speed and detection "
-             "keeps up as fast as your computer allows, so some frames are "
-             "skipped by the detector (the video itself is never choppy). "
-             "Process every frame: nothing is skipped, but it runs slower "
-             "than the video; the finished video plays when it is done.",
+        help="Live preview: every frame is analysed, in order, and you watch "
+             "each annotated picture as soon as it is ready (slower than the "
+             "video on a normal computer, but nothing is missed). The finished "
+             "smooth video plays at the end. "
+             "Real-time: the video plays at its normal speed and frames the "
+             "detector cannot keep up with are skipped - on a slow computer "
+             "that can skip almost the whole clip and miss violations.",
     )
     playback_realtime = playback.startswith("Real-time")
 
 # Webcams, CCTV and phones are always real time.
 realtime_mode = (is_live_mode or playback_realtime) and not is_photo_mode
 
+# Video files in "Live preview": every frame analysed, each result streamed.
+preview_stream = (source_type == "Video file") and not playback_realtime
+stream_mode = realtime_mode or preview_stream
+
+smooth_overlay = False
+
+if realtime_mode:
+    smooth_overlay = st.sidebar.checkbox(
+        "Smoother video (boxes may lag behind)",
+        value=False,
+        help="Off (recommended): every picture shows its own boxes, so they "
+             "always sit on the right bike/rider, but the picture updates "
+             "only as fast as detection runs. On: the video plays smoothly "
+             "and the latest boxes are pasted on top, so on a fast bike the "
+             "boxes can be behind it. Only useful on a fast computer/GPU.",
+    )
+
+frame_stride = 1
+
+if preview_stream:
+    frame_stride = st.sidebar.slider(
+        "Speed: analyse every Nth frame", 1, 6, 3,
+        help="1 = every frame (most thorough, slowest). 3 = about 3x faster "
+             "and still follows bikes and finds violations. 5-6 = fastest.",
+    )
+
 record_video = False
 
 if is_photo_mode:
     pass
 elif playback_realtime:
-    st.sidebar.caption("To record the annotated video, use 'Process every "
-                       "frame'.")
+    st.sidebar.caption("To record the annotated video, use 'Live preview'.")
 else:
     record_video = st.sidebar.checkbox(
         "Record the annotated video",
@@ -431,12 +458,6 @@ else:
 
 update_every = 10
 
-if not realtime_mode and not is_photo_mode:
-    update_every = st.sidebar.slider(
-        "Progress preview every N frames", 1, 30, 10,
-        help="Only a progress peek while processing; the finished video "
-             "plays smoothly at the end. Higher = faster processing.",
-    )
 
 start = st.sidebar.button("Start", type="primary", disabled=not jobs)
 st.sidebar.button("Stop", help="Ends the current run (any click on the page also interrupts it).")
@@ -528,9 +549,9 @@ with tab_live:
                     )
                 else:
                     status_slot.caption(
-                        f"Playing {label} in real time | detector "
-                        f"{detector_fps:.1f} fps (the video is smooth; boxes "
-                        "refresh at the detector speed)"
+                        f"Analysing {label} | frame {stats['frame']} of "
+                        f"{stats['total_frames']} | detector "
+                        f"{detector_fps:.1f} fps"
                     )
 
             # Alerts for new violations
@@ -574,7 +595,7 @@ with tab_live:
 
             display_callback = None
 
-            if realtime_mode:
+            if stream_mode:
                 server = get_stream_server()
                 display_callback = server.push
 
@@ -590,15 +611,15 @@ with tab_live:
                     source,
                     show_window=False,
                     frame_callback=make_callback(
-                        label, is_live, show_frames=not realtime_mode
+                        label, is_live, show_frames=not stream_mode
                     ),
-                    callback_every=(
-                        1 if is_photo_mode else (3 if realtime_mode else update_every)
-                    ),
+                    callback_every=(1 if is_photo_mode else 3),
                     live=is_live,
                     save_video=record_video,
                     realtime=realtime_mode,
                     display_callback=display_callback,
+                    smooth_overlay=smooth_overlay,
+                    frame_stride=frame_stride,
                 )
             except RuntimeError as error:
                 st.error(f"Could not open **{label}**: {error}")
@@ -608,6 +629,15 @@ with tab_live:
                 "label": label,
                 "stats": summary,
             }
+
+            if (playback_realtime and not is_live
+                    and summary.get("frames_analysed", 99) < 10):
+                st.warning(
+                    f"Real-time mode analysed only {summary['frames_analysed']} "
+                    "frame(s): this computer is too slow to keep up, so the "
+                    "rest of the clip was skipped and violations were missed. "
+                    "Choose **Live preview (every frame)** instead."
+                )
             last_run_id = summary["run_id"]
 
             # Files: replace the progress peek with the finished, smooth video

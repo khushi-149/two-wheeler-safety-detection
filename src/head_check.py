@@ -15,7 +15,7 @@ import cv2
 from rider_association import head_point
 
 
-def head_crop_detections(helmet_model, frame, person, conf, imgsz):
+def head_crop_detections(helmet_model, frame, person, conf, imgsz, around=None):
     """
     Run the helmet model on a small crop around the person's head (upscaled
     so it is not tiny). Returns detections in FULL-FRAME coordinates:
@@ -24,8 +24,15 @@ def head_crop_detections(helmet_model, frame, person, conf, imgsz):
     px1, py1, px2, py2 = person["box"]
     width, height = px2 - px1, py2 - py1
 
-    hx, hy = head_point(person)
-    radius = max(width * 0.40, height * 0.14, 20)
+    if around is not None:
+        # look at THIS head (a detected head box), not at the person's own head
+        # keypoint: with merged people the two can be different heads
+        ax1, ay1, ax2, ay2 = around
+        hx, hy = (ax1 + ax2) / 2.0, (ay1 + ay2) / 2.0
+        radius = max(ax2 - ax1, ay2 - ay1, 20) * 0.75
+    else:
+        hx, hy = head_point(person)
+        radius = max(width * 0.40, height * 0.14, 20)
 
     img_h, img_w = frame.shape[:2]
 
@@ -78,5 +85,25 @@ def verify_decision(detections, with_class, without_class, without_min):
             and best_without["conf"] >= without_min
             and best_without["conf"] > best_with):
         return best_without
+
+    return None
+
+
+def verify_with_decision(detections, with_class, without_class, with_min):
+    """
+    The opposite check: from zoomed head-crop detections, return a "with
+    helmet" detection if it clearly beats any "without helmet" one (a dark helmet
+    first called "Without Helmet"), else ``None`` (keep the original).
+    """
+    withs = [d for d in detections if d["cls"] == with_class]
+    withouts = [d for d in detections if d["cls"] == without_class]
+
+    best_without = max((d["conf"] for d in withouts), default=0.0)
+    best_with = max(withs, key=lambda d: d["conf"], default=None)
+
+    if (best_with is not None
+            and best_with["conf"] >= with_min
+            and best_with["conf"] > best_without):
+        return best_with
 
     return None
