@@ -3,6 +3,7 @@ Explain, stage by stage, how the REAL pipeline counts riders and helmets on one
 photo, so a wrong answer can be traced to the stage that caused it.
 
     python scripts/explain_photo.py path/to/photo.jpg
+    python scripts/explain_photo.py frame_from_a_video.jpg --video   (video crop size)
 
 Stages printed: bikes found -> people (pose) -> who rides which bike ->
 heads (helmet model) -> which head belongs to which rider.
@@ -78,7 +79,9 @@ def main(path: str) -> int:
         return 1
 
     pipe = ViolationPipeline(use_plates=False)
-    pipe.photo_mode = True   # exactly like the dashboard: larger crops for photos
+    # like the dashboard: larger crops for photos. For a frame taken from a VIDEO
+    # pass --video, which uses the smaller video crop size.
+    pipe.photo_mode = "--video" not in sys.argv
     traffic = YOLO(cfg.model_path(cfg.PHOTO_TRAFFIC_MODEL))
 
     print(f"Image {frame.shape[1]}x{frame.shape[0]}   traffic model: {cfg.PHOTO_TRAFFIC_MODEL}")
@@ -170,8 +173,10 @@ def main(path: str) -> int:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
+    args = [a for a in sys.argv[1:] if a != "--video"]
+
+    if len(args) != 1:
         print(__doc__)
         sys.exit(2)
 
-    sys.exit(main(sys.argv[1]))
+    sys.exit(main(args[0]))

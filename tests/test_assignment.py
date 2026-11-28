@@ -173,3 +173,46 @@ def test_claims_report_which_rider_owns_which_head():
     assign_heads_to_bikes([head], [bike], rider_boxes, others, claims)
 
     assert len(claims) == 1 and claims[0][0] == riders[0]["box"]
+
+def test_fullframe_heads_fill_gaps_and_respect_regions():
+    from assignment import merge_fullframe_heads
+
+    crop = [{"box": [100, 100, 200, 200], "conf": 0.7, "cls": 0}]
+    full = [
+        {"box": [102, 98, 198, 202], "conf": 0.8, "cls": 0},      # same head, same class
+        {"box": [300, 100, 400, 200], "conf": 0.8, "cls": 0},     # missed by the crop
+        {"box": [900, 100, 990, 190], "conf": 0.9, "cls": 0},     # outside every bike region
+    ]
+    regions = [(0, 0, 500, 400)]
+
+    merged = merge_fullframe_heads(crop, full, regions)
+
+    assert len(merged) == 2
+    assert merged[0]["box"] == [100, 100, 200, 200]               # the crop's box is kept
+    assert merged[1]["box"] == [300, 100, 400, 200]
+
+
+def test_fullframe_head_overrides_a_conflicting_crop_call_only_when_clearly_better():
+    from assignment import merge_fullframe_heads
+
+    regions = [(0, 0, 500, 400)]
+    crop = [{"box": [100, 100, 200, 200], "conf": 0.45, "cls": 1}]    # crop says Without
+
+    better = [{"box": [100, 100, 200, 200], "conf": 0.80, "cls": 0}]  # whole frame: With
+    close = [{"box": [100, 100, 200, 200], "conf": 0.47, "cls": 0}]
+
+    assert merge_fullframe_heads(crop, better, regions)[0]["cls"] == 0
+    assert merge_fullframe_heads(crop, close, regions)[0]["cls"] == 1
+
+
+def test_confident_whole_frame_helmet_beats_a_unsure_crop_without_helmet():
+    from assignment import merge_fullframe_heads
+
+    regions = [(0, 0, 500, 400)]
+    crop = [{"box": [100, 100, 200, 200], "conf": 0.60, "cls": 1}]     # crop: Without, unsure
+    full = [{"box": [100, 100, 200, 200], "conf": 0.55, "cls": 0}]     # whole frame: With
+
+    assert merge_fullframe_heads(crop, full, regions)[0]["cls"] == 0
+
+    sure = [{"box": [100, 100, 200, 200], "conf": 0.90, "cls": 1}]     # crop: Without, very sure
+    assert merge_fullframe_heads(sure, full, regions)[0]["cls"] == 1   # needs a clear win to flip

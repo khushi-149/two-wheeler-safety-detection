@@ -137,6 +137,32 @@ CACHE_MAX_AGE = 90
 COUNT_HISTORY = 5
 MIN_HISTORY_FOR_TRIPLE = 3
 
+# A helmet verdict can flicker from one analysed video frame to the next (a
+# dark helmet seen as "without" once). A bike is only reported for NO HELMET
+# when at least NO_HELMET_VOTES of its last NO_HELMET_WINDOW analyses said so;
+# until then the head is shown as "HELMET?". (A photo is one frame: 1 vote.)
+NO_HELMET_WINDOW = 5
+NO_HELMET_VOTES = 3
+# Once a head is confirmed "without helmet" it stays that way until this many
+# analyses IN A ROW call it "with helmet" (the model flickers on bare heads
+# too; the label must not blink on and off).
+NO_HELMET_STICKY = 4
+# Speed: the zoomed second look at each head (_refine_heads) costs several model
+# calls per bike. In VIDEO a bike whose last check was clean (every head
+# "with helmet", nothing unsure) is re-checked in detail only every
+# REFINE_EVERY-th analysis; any doubtful bike is refined on every analysis.
+REFINE_EVERY = 3
+
+# "No helmet" is a serious accusation, so a GUESS (a head the model never found)
+# needs evidence of a bare head: at least this share of the head box must be
+# skin-coloured. A dark helmet / visor has almost none; a bare face and neck do.
+SKIN_MIN_FRACTION = 0.12
+# VIDEO only: a rider whose head the helmet model never finds, in NO_HELMET_VOTES
+# of the last NO_HELMET_WINDOW analyses, is reported as "without helmet" (the
+# model is trained to spot helmets, so a visible head it keeps ignoring is
+# usually bare). Photos keep the neutral yellow "HELMET?" marker.
+UNRESOLVED_HEAD_IS_NO_HELMET_IN_VIDEO = True
+
 # Input size for the per-bike crops. Bigger = more pixels per head = better
 # helmet / veil / turban recognition, but slower. On a 4000 px photo the helmet
 # model missed 2 of 3 heads at the default 640 but found all 3 at 1280; the
@@ -147,6 +173,18 @@ CROP_IMGSZ = 640
 # Photos are analysed only once, so speed does not matter: the crop size is
 # raised automatically to the crop's own pixel size, up to this limit.
 CROP_IMGSZ_MAX = 1280
+
+# Second opinion on helmets: also run the helmet model on the WHOLE frame and
+# add the heads the bike-crop pass missed (a dark full-face helmet can be lost
+# in a crop yet found easily in the full picture). Where both passes see the
+# same head but disagree, the more confident one wins. Costs one extra helmet
+# inference per analysed frame; set False for maximum speed.
+FULLFRAME_HELMET_PASS = True
+# ... but only when the bike crops found fewer heads than there are people (so a
+# normal frame, where every rider's head was found, skips the extra pass).
+FULLFRAME_ONLY_IF_HEAD_MISSING = True
+FULLFRAME_IMGSZ = 640
+FULLFRAME_MIN_GAIN = 0.05      # a conflicting full-frame call must beat the crop's by this
 
 # Print timing every N frames (0 = off)
 PROGRESS_EVERY = 30
@@ -180,6 +218,11 @@ MAX_HEAD_ABOVE_PERSON = 0.50
 # Fallback: a person counts as a rider if at least this share of the person
 # box overlaps the motorcycle box.
 MIN_RIDER_OVERLAP = 0.10
+
+# Side to side, a rider's body sits over the bike. Someone walking PAST a bike
+# only touches its edge, so at least this share of the person's WIDTH must lie
+# inside the bike box (0 = off, 1 = fully inside).
+MIN_RIDER_WIDTH_OVERLAP = 0.40
 
 # Person boxes from overlapping crops with at least this IoU are the same person.
 PERSON_DUP_IOU = 0.75
@@ -316,3 +359,9 @@ DEBUG_DRAW_PEOPLE = False
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv", ".m4v", ".webm")
+
+# Video frames bigger than this (longest side, pixels) are shrunk before
+# analysis. A 4K frame holds 4x the pixels of full HD but the models look at
+# 640-1280 px crops anyway, so analysis, drawing and saving get much faster
+# while helmets stay as visible. Set 0 to keep the original size.
+VIDEO_MAX_SIDE = 1920

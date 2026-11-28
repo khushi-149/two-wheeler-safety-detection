@@ -32,6 +32,7 @@ from assignment import (
     hip_from_keypoints,
     dedupe_nested_bikes,
     drop_headless_people,
+    merge_fullframe_heads,
     match_no_helmet_to_motorcycle,
     merge_duplicate_people,
     merge_nested_heads,
@@ -40,8 +41,10 @@ from assignment import (
     unresolved_rider_heads,
 )
 from capture import IMAGE_EXTENSIONS, ImageCapture, ThreadedCapture
-from geometry import iou
-from head_check import head_crop_detections, verify_decision, verify_with_decision
+from geometry import iou, point_in_box
+from head_check import (
+    head_crop_detections, skin_fraction, verify_decision, verify_with_decision,
+)
 from drawing import (BLUE, GREEN, RED, WHITE, Style, draw_label, draw_tag,
                      draw_warning, make_header)
 from plate_reader import AsyncPlateReader, PlateReader, PlateTracker
@@ -58,6 +61,18 @@ from settings import model_path, resolve_path
 from violation_db import ViolationDB
 
 log = logging.getLogger(__name__)
+
+def _grow(box, fraction):
+    """``box`` enlarged by ``fraction`` of its size on every side."""
+    dx, dy = (box[2] - box[0]) * fraction, (box[3] - box[1]) * fraction
+    return [box[0] - dx, box[1] - dy, box[2] + dx, box[3] + dy]
+
+
+def _relative(box, anchor):
+    """``box`` expressed relative to ``anchor`` (a bike's top-left corner)."""
+    return [box[0] - anchor[0], box[1] - anchor[1],
+            box[2] - anchor[0], box[3] - anchor[1]]
+
 
 # class id of the neutral "helmet unknown" marker (not a detector class)
 UNKNOWN_HELMET = -1
@@ -244,7 +259,7 @@ class ViolationPipeline:
         """
         h, w = frame.shape[:2]
 
-        crops, offsets = [], []
+        crops, offsets, regions = [], [], []
 
         for moto in motorcycles:
             rx1, ry1, rx2, ry2 = bike_region(moto["box"], w, h)
@@ -254,6 +269,7 @@ class ViolationPipeline:
 
             crops.append(frame[ry1:ry2, rx1:rx2])
             offsets.append((rx1, ry1))
+            regions.append((rx1, ry1, rx2, ry2))
 
         if not crops:
             return [], []
@@ -290,6 +306,14 @@ class ViolationPipeline:
                     "cls": int(b.cls[0]),
                 })
 
+        if cfg.FULLFRAME_HELMET_PASS and not (
+                cfg.FULLFRAME_ONLY_IF_HEAD_MISSING
+                and len(helmets) >= len(people)
+                and not any(h["cls"] == self.no_helmet_class for h in helmets)):
+            helmets = merge_fullframe_heads(
+                helmets, self._fullframe_heads(frame), regions,
+                cfg.FULLFRAME_MIN_GAIN, with_cls=self.helmet_class)
+
         # kept for scripts/explain_photo.py (what the models saw before filtering)
         self.last_debug = {"raw_people": list(people), "raw_helmets": list(helmets)}
 
@@ -302,6 +326,21 @@ class ViolationPipeline:
         return people, helmets
 
     # ---------------------------------------------------------------
+
+    def _fullframe_heads(self, frame):
+        """Helmet model on the whole frame: a second opinion for the crop pass."""
+        result = self.helmet_model(
+            frame, conf=cfg.HELMET_CONF, imgsz=cfg.FULLFRAME_IMGSZ,
+            half=USE_GPU, verbose=False)[0]
+
+        if result.boxes is None:
+            return []
+
+        return [
+            {"box": b.xyxy[0].cpu().tolist(), "conf": float(b.conf[0]),
+             "cls": int(b.cls[0])}
+            for b in result.boxes
+        ]
 
     def _crop_imgsz(self, crops):
         """
@@ -402,6 +441,15 @@ class ViolationPipeline:
 
                     continue
 
+                # Its head point is already inside a head we have: this "person"
+                # is the same rider reported twice (or a piece of one), not a
+                # rider without a helmet. Never invent a violation for it.
+                hp = head_point(person)
+
+                if any(point_in_box(hp, _grow(o[0]["box"], 0.15)) for o in owners):
+                    self._note("skipped: head already counted", bike_index, None, [], None)
+                    continue
+
                 found = head_crop_detections(
                     self.helmet_model, frame, person,
                     cfg.RECOVERY_CONF, cfg.RECOVERY_IMGSZ)
@@ -417,10 +465,19 @@ class ViolationPipeline:
                         cfg.INFER_NO_HELMET_IF_FACE and person.get("face", 0) >= 2):
                     hx, hy = head_point(person)
                     r = max((body[2] - body[0]) * 0.20, (body[3] - body[1]) * 0.07, 10)
-                    owners.append((
-                        {"box": [hx - r, hy - r, hx + r, hy + r],
-                         "cls": self.no_helmet_class, "conf": 0.0},
-                        bike_index, False))
+                    guess = [hx - r, hy - r, hx + r, hy + r]
+
+                    # a guess needs a bare head: skin-coloured pixels, not a
+                    # dark helmet (INFER_NO_HELMET=True skips this check)
+                    if (cfg.INFER_NO_HELMET
+                            or skin_fraction(frame, guess) >= cfg.SKIN_MIN_FRACTION):
+                        owners.append((
+                            {"box": guess, "cls": self.no_helmet_class,
+                             "conf": 0.0},
+                            bike_index, False))
+                    else:
+                        self._note("guess dropped: no skin in head box",
+                                   bike_index, None, [], None)
 
         # Heads with no body of their own (a pillion the pose model missed) get
         # the same second look.
@@ -435,8 +492,99 @@ class ViolationPipeline:
 
         return owners
 
+    def _judge_heads(self, heads, anchor, previous_tracks, needed, unresolved_is_no,
+                     frame_size=None):
+        """
+        Per-head verdict with memory. Each head is followed from analysis to
+        analysis (matched by position relative to its bike). It is shown as
+        "no helmet" only when ``needed`` of its own last NO_HELMET_WINDOW
+        checks said so; once confirmed it stays until NO_HELMET_STICKY "with
+        helmet" checks in a row. Changes each head's ``cls`` in place and
+        returns the updated tracks.
+        """
+        tracks, used = [], set()
+
+        for head in heads:
+            rel = _relative(head["box"], anchor)
+            cx, cy = (rel[0] + rel[2]) / 2, (rel[1] + rel[3]) / 2
+            best, best_dist = None, float("inf")
+
+            for k, old in enumerate(previous_tracks):
+                if k in used:
+                    continue
+
+                ox, oy = (old["rel"][0] + old["rel"][2]) / 2, (old["rel"][1] + old["rel"][3]) / 2
+                same = (iou(rel, old["rel"]) >= 0.3
+                        or point_in_box((cx, cy), old["rel"])
+                        or point_in_box((ox, oy), rel))
+                dist = (cx - ox) ** 2 + (cy - oy) ** 2
+
+                if same and dist < best_dist:
+                    best, best_dist = k, dist
+
+            if best is None and len(heads) == 1 and len(previous_tracks) == 1 \
+                    and not used:
+                best = 0        # the bike's only head moved/jittered: still the same head
+
+            if best is None:
+                track = {"votes": [], "run": 0, "confirmed": False}
+            else:
+                used.add(best)
+                track = dict(previous_tracks[best])
+
+            cls = head["cls"]
+            bare_unknown = (cls == UNKNOWN_HELMET
+                            and head.get("skin", 1.0) >= cfg.SKIN_MIN_FRACTION)
+            says_no = cls == self.no_helmet_class or (unresolved_is_no and bare_unknown)
+
+            # A head cut off by the frame border cannot be judged reliably
+            # (a dark helmet half out of view looks like bare hair): it is never
+            # a violation, only "helmet unknown".
+            if frame_size and says_no:
+                hx1, hy1, hx2, hy2 = head["box"]
+                m = 0.01 * frame_size[0]
+                if hx1 <= m or hy1 <= m or hx2 >= frame_size[0] - m:
+                    track["rel"] = rel
+                    track["votes"] = (track["votes"] + [False])[-cfg.NO_HELMET_WINDOW:]
+                    if not track["confirmed"]:
+                        head["cls"] = UNKNOWN_HELMET
+                        tracks.append(track)
+                        continue
+                    says_no = False
+
+            track["rel"] = rel
+            track["votes"] = (track["votes"] + [says_no])[-cfg.NO_HELMET_WINDOW:]
+
+            if says_no:
+                track["run"] = 0
+            elif cls == self.helmet_class:
+                track["run"] += 1
+
+            if not track["confirmed"] and sum(track["votes"]) >= needed:
+                track["confirmed"], track["run"] = True, 0
+
+            if track["confirmed"] and not says_no and track["run"] >= cfg.NO_HELMET_STICKY:
+                track["confirmed"], track["votes"] = False, []      # cleared
+
+            if track["confirmed"]:
+                head["cls"] = self.no_helmet_class
+            elif says_no:
+                # not enough agreeing checks yet: if this head was already seen
+                # wearing a helmet (or has history) show that, not a flicker;
+                # a brand-new head shows the neutral marker
+                steady = len(track["votes"]) >= needed or not all(track["votes"])
+                head["cls"] = self.helmet_class if steady else UNKNOWN_HELMET
+
+            tracks.append(track)
+
+        return tracks
+
     def _analyze_cached(self, frame, motorcycles, cache, frame_count,
-                        min_history_for_triple=cfg.MIN_HISTORY_FOR_TRIPLE):
+                        min_history_for_triple=cfg.MIN_HISTORY_FOR_TRIPLE,
+                        no_helmet_votes=cfg.NO_HELMET_VOTES,
+                        unresolved_is_no=False,
+                        analyze_every=cfg.ANALYZE_EVERY,
+                        refine_every=1):
         """
         Staggered rider/helmet analysis.
 
@@ -450,7 +598,7 @@ class ViolationPipeline:
         due = [
             i for i, m in enumerate(motorcycles)
             if m["track_id"] not in cache
-            or (m["track_id"] + frame_count) % cfg.ANALYZE_EVERY == 0
+            or (m["track_id"] + frame_count) % analyze_every == 0
         ]
 
         people = []
@@ -471,8 +619,18 @@ class ViolationPipeline:
                 helmet_dets, motorcycles, rider_boxes, other_boxes, claims,
                 people=people,
             )
+            # Zoomed second look: always for new or doubtful bikes; a bike whose
+            # last analysis was clean only every REFINE_EVERY-th time (speed).
+            refine_due = [
+                i for i in due
+                if motorcycles[i]["track_id"] not in cache
+                or refine_every <= 1
+                or cache[motorcycles[i]["track_id"]].get("n", 0) % refine_every == 0
+                or any(cache[motorcycles[i]["track_id"]].get("votes", [])[-1:])
+                or any(cache[motorcycles[i]["track_id"]].get("unknown", [])[-1:])
+            ]
             owners = self._refine_heads(
-                frame, people, rider_boxes, owners, claims, due
+                frame, people, rider_boxes, owners, claims, refine_due
             )
 
             for i in due:
@@ -489,7 +647,20 @@ class ViolationPipeline:
                 for box in unresolved_rider_heads(
                         rider_boxes.get(i, []), people,
                         [h["box"] for h in heads]):
-                    heads.append({"box": box, "cls": UNKNOWN_HELMET, "extra": False})
+                    heads.append({"box": box, "cls": UNKNOWN_HELMET, "extra": False,
+                                  "skin": skin_fraction(frame, box)})
+
+                # A "head" marker that swallows another head is a ghost person
+                # (e.g. trees): drop it, keep the real, smaller one.
+                heads = [
+                    h for h in heads
+                    if not (h["cls"] == UNKNOWN_HELMET and any(
+                        o is not h and point_in_box(
+                            ((o["box"][0] + o["box"][2]) / 2,
+                             (o["box"][1] + o["box"][3]) / 2), h["box"])
+                        and (o["box"][2] - o["box"][0]) < 0.7 * (h["box"][2] - h["box"][0])
+                        for o in heads))
+                ]
 
                 raw = counts[i] + sum(1 for h in heads if h["extra"])
 
@@ -497,10 +668,38 @@ class ViolationPipeline:
                 history = (previous["history"] if previous else []) + [raw]
                 history = history[-cfg.COUNT_HISTORY:]
 
+                # Each head is judged on its OWN history (see _judge_heads), so one
+                # rider's confirmed violation never turns a neighbour red.
+                anchor = (bike["box"][0], bike["box"][1])
+                fh, fw = frame.shape[:2]
+                margin = 0.01 * fw
+                bx = bike["box"]
+                # a bike entering/leaving the frame is only visible for a few
+                # analyses, so it may confirm one vote sooner
+                bike_edge = (bx[0] <= margin or bx[2] >= fw - margin
+                             or bx[3] >= fh - margin)
+                needed = max(2, no_helmet_votes - 1) if bike_edge else no_helmet_votes
+                tracks = self._judge_heads(
+                    heads, anchor, previous.get("tracks", []) if previous else [],
+                    needed, unresolved_is_no, (fw, fh))
+
+                # bike-level flags, used only to decide how often to re-check
+                said_no = any(
+                    t["votes"][-1:] == [True] for t in tracks)
+                votes = ((previous["votes"] if previous else []) + [said_no])
+                votes = votes[-cfg.NO_HELMET_WINDOW:]
+                unknown_votes = ((previous.get("unknown", []) if previous else [])
+                                 + [any(h["cls"] == UNKNOWN_HELMET for h in heads)]
+                                 )[-cfg.NO_HELMET_WINDOW:]
+
                 cache[track_id] = {
                     "anchor": (bike["box"][0], bike["box"][1]),
                     "count": smoothed_count(history, min_history_for_triple),
                     "history": history,
+                    "votes": votes,
+                    "n": (previous.get("n", 0) if previous else 0) + 1,
+                    "unknown": unknown_votes,
+                    "tracks": tracks,
                     "heads": heads,
                     "seen": frame_count,
                 }
@@ -519,9 +718,11 @@ class ViolationPipeline:
 
             for head in entry["heads"]:
                 b = head["box"]
+                cls = head["cls"]
+
                 head_owners.append((
                     {"box": [b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy],
-                     "cls": head["cls"], "conf": 1.0},
+                     "cls": cls, "conf": 1.0},
                     i,
                     head["extra"],
                 ))
@@ -603,6 +804,15 @@ class ViolationPipeline:
         if width <= 0 or height <= 0:
             cap.release()
             raise RuntimeError("Invalid video dimensions.")
+
+        # shrink very large video (4K) once, up front: much faster, same accuracy
+        shrink = 1.0
+
+        if (not is_image and cfg.VIDEO_MAX_SIDE
+                and max(width, height) > cfg.VIDEO_MAX_SIDE):
+            shrink = cfg.VIDEO_MAX_SIDE / max(width, height)
+            width = int(width * shrink) // 2 * 2
+            height = int(height * shrink) // 2 * 2
 
         style = Style(height, width)
 
@@ -811,8 +1021,25 @@ class ViolationPipeline:
                 if not ret:
                     break
 
+                if shrink < 1.0:
+                    frame = cv2.resize(frame, (width, height),
+                                       interpolation=cv2.INTER_AREA)
+
                 frame_count += 1
                 source_index += 1
+
+                if frame_count == 1 and display_callback is not None and not is_image:
+                    # show the video at once; the first analysis takes a while
+                    try:
+                        first = cv2.resize(frame, (disp_w, disp_h),
+                                           interpolation=cv2.INTER_AREA)
+                        for colour, thick in (((0, 0, 0), 4), ((0, 255, 255), 2)):
+                            cv2.putText(first, "Analysing...", (10, 28),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                                        colour, thick, cv2.LINE_AA)
+                        display_callback(first)
+                    except Exception as error:
+                        log.warning("Display error: %s", error)
 
                 if live:
                     video_time = time.perf_counter() - t_start
@@ -849,6 +1076,18 @@ class ViolationPipeline:
                         min_history_for_triple=(
                             1 if is_image else cfg.MIN_HISTORY_FOR_TRIPLE
                         ),
+                        no_helmet_votes=1 if is_image else cfg.NO_HELMET_VOTES,
+                        # frames are already skipped (stride / real-time): check
+                        # every frame we do process, so the checks stay as close
+                        # together in VIDEO time as with no skipping
+                        analyze_every=(
+                            1 if (live or paced_file)
+                            else max(1, cfg.ANALYZE_EVERY // stride)
+                        ),
+                        refine_every=1 if is_image else cfg.REFINE_EVERY,
+                        unresolved_is_no=(
+                            not is_image
+                            and cfg.UNRESOLVED_HEAD_IS_NO_HELMET_IN_VIDEO),
                     )
                     helmet_dets = []
                     riding_status = detect_triple_riding(rider_counts)

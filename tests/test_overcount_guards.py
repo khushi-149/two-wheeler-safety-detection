@@ -2,7 +2,7 @@
 
 from assignment import (
     assign_heads_to_bikes, assign_people_to_bikes,
-    drop_headless_people, merge_nested_heads,
+    drop_headless_people, merge_nested_heads, width_overlap,
 )
 
 BIKE = {"box": [200, 250, 400, 420], "conf": 0.9, "track_id": 1}
@@ -154,3 +154,19 @@ def test_rider_without_a_found_head_gets_an_estimated_head_box():
     cx = (missing[0][0] + missing[0][2]) / 2
     assert 220 <= cx <= 320 and missing[0][1] < 200  # near the top of that rider
     assert unresolved_rider_heads(riders, people, []) != []
+
+
+def test_pedestrian_walking_past_the_edge_of_a_bike_is_not_a_rider():
+    # bike box x 200-400; the walker stands at its rear edge, only 20% inside it
+    riders = [
+        person([210, 120, 280, 400], (245, 150), (245, 300), 0.9),
+        person([300, 120, 380, 400], (340, 150), (340, 300), 0.9),
+    ]
+    walker = person([160, 130, 210, 400], (185, 160), (190, 300), 0.8)   # 10 of 50 px inside
+
+    counts, rider_boxes, others = assign_people_to_bikes(riders + [walker], [BIKE])
+
+    assert counts[0] == 2
+    assert walker["box"] in others
+    assert width_overlap(walker, BIKE) < 0.4
+    assert width_overlap(riders[0], BIKE) == 1.0

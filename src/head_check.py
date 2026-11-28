@@ -15,6 +15,25 @@ import cv2
 from rider_association import head_point
 
 
+def skin_fraction(frame, box):
+    """
+    Share (0-1) of ``box`` that is skin-coloured. A rough test (YCrCb colour
+    range) used only to tell a bare head from a dark helmet when the helmet
+    model found nothing. Returns 0 for an empty / off-frame box.
+    """
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = (int(round(v)) for v in box)
+    x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return 0.0
+
+    ycrcb = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2YCrCb)
+    mask = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
+
+    return float(mask.mean()) / 255.0
+
+
 def head_crop_detections(helmet_model, frame, person, conf, imgsz, around=None):
     """
     Run the helmet model on a small crop around the person's head (upscaled

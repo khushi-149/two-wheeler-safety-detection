@@ -17,7 +17,7 @@ from settings import (
     HEAD_TOP_ALLOWANCE, HEAD_ZONE,
     HIDDEN_BELOW, HIDDEN_SIDE, HIDDEN_TOP,
     MAX_HEAD_ABOVE_MOTO, MAX_HEAD_ABOVE_PERSON,
-    MIN_HISTORY_FOR_TRIPLE, MIN_RIDER_OVERLAP,
+    MIN_HISTORY_FOR_TRIPLE, MIN_RIDER_OVERLAP, MIN_RIDER_WIDTH_OVERLAP,
     SEAT_MARGIN_BOTTOM, SEAT_MARGIN_SIDE, SEAT_MARGIN_TOP,
 )
 
@@ -195,6 +195,14 @@ def body_overlap(person, moto):
     return width * height / parea
 
 
+def width_overlap(person, moto):
+    """Share of the person's WIDTH that lies inside the motorcycle box's width."""
+    px1, _py1, px2, _py2 = person["box"]
+    bx1, _by1, bx2, _by2 = moto["box"]
+
+    return max(0.0, min(px2, bx2) - max(px1, bx1)) / max(1.0, px2 - px1)
+
+
 def merge_nested_heads(dets, threshold=HEAD_MERGE_IOA):
     """
     Keep one box per head: a detection mostly INSIDE a more confident one (a face
@@ -363,6 +371,10 @@ def assign_people_to_bikes(people, motorcycles):
             if body_overlap(person, moto) < MIN_RIDER_OVERLAP:
                 continue
 
+            # ... and is over it side to side (a pedestrian walking past is not)
+            if width_overlap(person, moto) < MIN_RIDER_WIDTH_OVERLAP:
+                continue
+
             dist = abs(sx - (bx1 + bx2) / 2.0) / max(bw, 1.0)
 
             if dist < best_dist:
@@ -382,6 +394,9 @@ def assign_people_to_bikes(people, motorcycles):
                     continue
 
                 if not is_plausible_rider(person, moto):
+                    continue
+
+                if width_overlap(person, moto) < MIN_RIDER_WIDTH_OVERLAP:
                     continue
 
                 ix1, iy1 = max(px1, bx1), max(py1, by1)
@@ -593,3 +608,50 @@ def unresolved_rider_heads(riders, people, head_boxes):
         found.append([cx - size / 2, cy - size / 2, cx + size / 2, cy + size / 2])
 
     return found
+
+
+def merge_fullframe_heads(crop_heads, full_heads, regions, min_gain=0.05,
+                          with_cls=0, with_min=0.50, without_max=0.75):
+    """
+    Combine helmet detections from the bike crops with those from the whole frame.
+
+    * a whole-frame head outside every bike ``region`` is ignored (not a rider);
+    * one the crops did not see at all is added;
+    * one that matches a crop head (same place) with a DIFFERENT class replaces
+      it only when it is clearly more confident (``min_gain``);
+    * same place and same class: the crop's box is kept.
+    """
+    merged = list(crop_heads)
+
+    for head in full_heads:
+        cx, cy = box_center(head["box"])
+
+        if not any(r[0] <= cx <= r[2] and r[1] <= cy <= r[3] for r in regions):
+            continue
+
+        match = None
+
+        for index, existing in enumerate(merged):
+            ex, ey = box_center(existing["box"])
+
+            if (iou(head["box"], existing["box"]) >= 0.3
+                    or point_in_box((cx, cy), existing["box"])
+                    or point_in_box((ex, ey), head["box"])):
+                match = index
+                break
+
+        if match is None:
+            merged.append(head)
+        elif merged[match]["cls"] != head["cls"]:
+            crop = merged[match]
+
+            # A "without helmet" call is an accusation, so a whole-frame
+            # "with helmet" that is reasonably sure beats a crop "without"
+            # that is not very sure (dark helmets are often misread in crops).
+            helmet_wins = (head["cls"] == with_cls and head["conf"] >= with_min
+                           and crop["conf"] < without_max)
+
+            if helmet_wins or head["conf"] >= crop["conf"] + min_gain:
+                merged[match] = head
+
+    return merged

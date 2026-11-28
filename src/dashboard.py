@@ -106,6 +106,48 @@ def save_upload(uploaded, folder):
     return path
 
 
+def delete_files(paths, root_folder):
+    """
+    Delete files, but ONLY ones inside `root_folder` (data/videos or data/images,
+    including their uploads sub-folder). Returns how many files were removed.
+    """
+    root = os.path.realpath(root_folder)
+    removed = 0
+
+    for path in paths:
+        real = os.path.realpath(path)
+
+        if real.startswith(root + os.sep) and os.path.isfile(real):
+            try:
+                os.remove(real)
+                removed += 1
+            except OSError:
+                pass
+
+    return removed
+
+
+def delete_panel(files, root_folder, key):
+    """Sidebar box to delete any file shown in the list above it."""
+    if not files:
+        return
+
+    with st.sidebar.expander("Delete files from this list"):
+        doomed = st.multiselect(
+            "Select files to delete", files, key=f"{key}_del_pick",
+            format_func=lambda p: os.path.relpath(p, root_folder),
+        )
+        sure = st.checkbox("Yes, delete the selected files permanently",
+                           key=f"{key}_del_ok")
+
+        if st.button("Delete", key=f"{key}_del_btn", disabled=not (doomed and sure)):
+            n = delete_files(doomed, root_folder)
+            st.session_state[f"{key}_del_pick"] = []
+            st.session_state[f"{key}_del_ok"] = False
+            st.toast(f"Deleted {n} file(s)")
+            rerun_page()
+
+
 def stream_label(url):
     """Show only the host of a stream URL (never its username/password)."""
     try:
@@ -201,6 +243,58 @@ def records_to_frame(records):
     })
 
 
+VIOLATION_LABELS = {"no_helmet": "No helmet", "triple_riding": "Triple riding"}
+
+
+def clock(seconds):
+    """72.4 -> '1:12'; missing -> '-'."""
+    if seconds is None or pd.isna(seconds):
+        return "-"
+
+    seconds = int(seconds)
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def tidy_records(records, with_source=False):
+    """Violation records as a clean, readable table."""
+    rows = []
+
+    for r in records:
+        row = {}
+
+        if with_source:
+            row["Date"] = str(r["detected_at"]).replace("T", " ")
+            row["Source"] = r["video_name"] or "-"
+
+        row["Bike"] = f"#{r['track_id']}"
+        row["Violation"] = VIOLATION_LABELS.get(r["violation_type"], r["violation_type"])
+        row["Time in video"] = clock(r["video_time"])
+        row["Plate"] = r["plate_number"] or "not read"
+        row["Plate confidence"] = (
+            f"{round(r['plate_conf'] * 100)}%" if r["plate_conf"] else "-"
+        )
+
+        if with_source:
+            row["Run"] = r["run_id"]
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def show_editor(container, df, **kwargs):
+    """st.data_editor that works on both old and new Streamlit versions."""
+    try:
+        return container.data_editor(df, width="stretch", hide_index=True, **kwargs)
+    except Exception:
+        return container.data_editor(
+            df, use_container_width=True, hide_index=True, **kwargs)
+
+
+def rerun_page():
+    (getattr(st, "rerun", None) or st.experimental_rerun)()
+
+
 # -------------------- Sidebar: choose the input --------------------
 
 st.sidebar.title("Input source")
@@ -233,6 +327,7 @@ if source_type == "Video file":
                 format_func=lambda p: os.path.relpath(p, VIDEO_FOLDER),
             )
             jobs.append((picked, os.path.basename(picked), False))
+            delete_panel(videos, VIDEO_FOLDER, "video")
         else:
             ready_hint = f"No videos found in {VIDEO_FOLDER}. Upload one instead."
     else:
@@ -267,6 +362,7 @@ elif source_type == "Photo(s)":
             )
             for p in chosen:
                 jobs.append((p, os.path.basename(p), False))
+            delete_panel(photos, PHOTO_FOLDER, "photo")
         else:
             ready_hint = f"No photos found in {PHOTO_FOLDER}. Upload some instead."
 
@@ -721,13 +817,9 @@ with tab_results:
         if not records:
             st.success("No violations were recorded in this run.")
         else:
-            table = records_to_frame(records)
+            table = tidy_records(records)
 
-            show_table(
-                st,
-                table[["bike ID", "violation", "detected at", "time (s)",
-                       "plate", "plate conf"]],
-            )
+            show_table(st, table)
 
             st.download_button(
                 "Download violation records (CSV)",
@@ -790,49 +882,123 @@ with tab_history:
     c2.metric("All-time triple riding", totals["triple_riding"])
     c3.metric("Records with a plate", totals["with_plate"])
 
-    history = records_to_frame(db.fetch())
+    overview = db.runs_overview()
 
-    if history.empty:
+    if not overview:
         st.info("No violations logged yet.")
     else:
+        # ---------- Runs: one tidy row per run, tick to delete ----------
+        st.subheader("Runs")
+        st.caption("One row per analysed photo or video. Tick runs you no "
+                   "longer need, then press Delete.")
+
+        version = st.session_state.setdefault("runs_editor_version", 0)
+
+        runs_table = pd.DataFrame([
+            {
+                "Delete": False,
+                "Date": str(r["started"]).replace("T", " "),
+                "Source": r["source"] or "-",
+                "No helmet": int(r["no_helmet"] or 0),
+                "Triple riding": int(r["triple_riding"] or 0),
+                "Plates read": int(r["plates"] or 0),
+                "Run": r["run_id"],
+            }
+            for r in overview
+        ])
+
+        edited = show_editor(
+            st, runs_table,
+            key=f"runs_editor_{version}",
+            disabled=[c for c in runs_table.columns if c != "Delete"],
+        )
+
+        selected = edited.loc[edited["Delete"], "Run"].tolist()
+
+        if selected:
+            count = sum(r["records"] for r in overview if r["run_id"] in selected)
+            st.warning(
+                f"{len(selected)} run(s) selected: {count} record(s) and their "
+                "evidence pictures will be deleted permanently."
+            )
+
+            if st.button("Delete selected runs", type="primary"):
+                removed = db.delete_runs(selected)
+
+                for run_id in selected:
+                    st.session_state.runs.pop(run_id, None)
+
+                st.session_state.runs_editor_version = version + 1
+                st.toast(f"Deleted {removed} record(s).")
+                rerun_page()
+
+        with st.expander("Delete everything"):
+            st.write("Removes every record and every evidence / plate picture. "
+                     "This cannot be undone.")
+            sure = st.checkbox("Yes, I want to delete all records")
+
+            if st.button("Delete all records", disabled=not sure):
+                removed = db.delete_all()
+                st.session_state.runs.clear()
+                st.session_state.runs_editor_version = version + 1
+                st.toast(f"Deleted {removed} record(s).")
+                rerun_page()
+
+        # ---------- Violations ----------
+        st.subheader("Violations")
+
+        records = db.fetch()
         f1, f2 = st.columns(2)
 
-        kinds = sorted(history["violation"].unique())
+        kinds = sorted({r["violation_type"] for r in records})
 
-        pick_types = f1.multiselect("Violation type", kinds, default=kinds)
+        pick_types = f1.multiselect(
+            "Violation type", kinds, default=kinds,
+            format_func=lambda k: VIOLATION_LABELS.get(k, k),
+        )
         pick_runs = f2.multiselect(
-            "Run", sorted(history["run_id"].unique(), reverse=True)
+            "Only these runs (leave empty for all)",
+            [r["run_id"] for r in overview],
+            format_func=lambda rid: next(
+                (f"{r['source'] or '-'}  ({str(r['started']).replace('T', ' ')})"
+                 for r in overview if r["run_id"] == rid), rid),
         )
 
-        view = history[history["violation"].isin(pick_types)]
+        shown = [
+            r for r in records
+            if r["violation_type"] in pick_types
+            and (not pick_runs or r["run_id"] in pick_runs)
+        ]
 
-        if pick_runs:
-            view = view[view["run_id"].isin(pick_runs)]
+        if not shown:
+            st.info("Nothing matches these filters.")
+        else:
+            table = tidy_records(shown, with_source=True)
 
-        show_table(
-            st,
-            view[["id", "run_id", "bike ID", "violation", "detected at",
-                  "time (s)", "plate", "plate conf"]],
-        )
+            show_table(st, table)
 
-        st.download_button(
-            "Download all shown records (CSV)",
-            view.to_csv(index=False).encode("utf-8"),
-            file_name="violations.csv",
-            mime="text/csv",
-        )
+            st.download_button(
+                f"Download these {len(shown)} records (CSV)",
+                table.to_csv(index=False).encode("utf-8"),
+                file_name="violations.csv",
+                mime="text/csv",
+            )
 
-        with st.expander("Evidence gallery (latest 30)"):
-            latest = [
-                r for r in db.fetch()
-                if r["evidence_path"] and os.path.exists(r["evidence_path"])
-            ][:30]
+            with st.expander("Evidence pictures (latest 30 of the list above)"):
+                pictures = [
+                    r for r in shown
+                    if r["evidence_path"] and os.path.exists(r["evidence_path"])
+                ][:30]
 
-            cols = st.columns(3)
+                if not pictures:
+                    st.caption("No evidence pictures for these records.")
 
-            for i, r in enumerate(latest):
-                caption = (
-                    f"bike {r['track_id']} | {r['violation_type']} | "
-                    f"{r['plate_number'] or 'plate not read'}"
-                )
-                show_image(cols[i % 3], r["evidence_path"], caption=caption)
+                cols = st.columns(3)
+
+                for i, r in enumerate(pictures):
+                    caption = (
+                        f"Bike #{r['track_id']} | "
+                        f"{VIOLATION_LABELS.get(r['violation_type'], r['violation_type'])}"
+                        f" | {r['plate_number'] or 'plate not read'}"
+                    )
+                    show_image(cols[i % 3], r["evidence_path"], caption=caption)

@@ -182,3 +182,66 @@ class ViolationDB:
                 "SELECT DISTINCT run_id FROM violations ORDER BY run_id DESC"
             )
             return [row["run_id"] for row in rows]
+
+    # ---------------------------------------------------------------
+
+    def runs_overview(self) -> list[dict]:
+        """One row per run (newest first): source, time and what was found."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT run_id,
+                       MAX(video_name) AS source,
+                       MIN(detected_at) AS started,
+                       SUM(violation_type = 'no_helmet') AS no_helmet,
+                       SUM(violation_type = 'triple_riding') AS triple_riding,
+                       COUNT(DISTINCT CASE WHEN plate_number IS NOT NULL
+                                           THEN track_id END) AS plates,
+                       COUNT(*) AS records
+                FROM violations
+                GROUP BY run_id
+                ORDER BY run_id DESC
+                """
+            )
+            return [dict(row) for row in rows]
+
+    def delete_runs(self, run_ids, remove_files: bool = True) -> int:
+        """
+        Delete every record of the given runs, and (by default) the evidence and
+        plate pictures they point to. Returns how many records were removed.
+        """
+        run_ids = list(run_ids)
+
+        if not run_ids:
+            return 0
+
+        marks = ",".join("?" for _ in run_ids)
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT evidence_path, plate_image_path FROM violations "
+                f"WHERE run_id IN ({marks})", run_ids,
+            ).fetchall()
+            removed = conn.execute(
+                f"DELETE FROM violations WHERE run_id IN ({marks})", run_ids
+            ).rowcount
+
+        if remove_files:
+            self._remove_files(
+                path for row in rows
+                for path in (row["evidence_path"], row["plate_image_path"])
+            )
+
+        return removed
+
+    def delete_all(self, remove_files: bool = True) -> int:
+        """Delete every record (and their pictures). Returns how many."""
+        return self.delete_runs(self.run_ids(), remove_files=remove_files)
+
+    @staticmethod
+    def _remove_files(paths) -> None:
+        for path in {p for p in paths if p}:
+            try:
+                os.remove(path)
+            except OSError:
+                pass        # already gone, or in use: not worth failing for
