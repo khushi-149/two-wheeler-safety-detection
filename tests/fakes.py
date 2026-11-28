@@ -107,6 +107,14 @@ class FakeTraffic:
         ids = [i for i, _ in items] if items else None
         return [Result(Boxes(boxes, ids if items else None))]
 
+    def __call__(self, source=None, **kwargs):
+        """Plain detection (used for photos): same script, remembers the kwargs."""
+        self.calls += 1
+        self.last_kwargs = kwargs
+        items = self.script(self.calls)
+        boxes = [Box(b, 0.9, 3) for _, b in items]
+        return [Result(Boxes(boxes))]
+
 
 class FakeHelmetModel:
     names = {0: "With Helmet", 1: "Without Helmet"}

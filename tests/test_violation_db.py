@@ -98,3 +98,44 @@ def test_failed_write_rolls_back_and_still_closes(db):
 def test_survives_special_characters(db):
     assert log(db, run="r'; DROP TABLE violations;--") is True
     assert len(db.fetch()) == 1
+
+def test_runs_overview_groups_one_row_per_run(db):
+    log(db, run="a", track=1)
+    log(db, run="a", track=1, vtype="triple_riding", plate_number="MH12AB1234", plate_conf=0.9)
+    log(db, run="b", track=2)
+
+    rows = {r["run_id"]: r for r in db.runs_overview()}
+
+    assert [r["run_id"] for r in db.runs_overview()] == ["b", "a"]
+    assert rows["a"]["no_helmet"] == 1 and rows["a"]["triple_riding"] == 1
+    assert rows["a"]["records"] == 2 and rows["a"]["plates"] == 1
+    assert rows["b"]["plates"] == 0
+
+
+def test_delete_runs_removes_records_and_their_pictures(db, tmp_path):
+    evidence = tmp_path / "e.jpg"
+    plate = tmp_path / "p.jpg"
+    evidence.write_bytes(b"x")
+    plate.write_bytes(b"x")
+
+    db.log_violation("a", "clip.mp4", 1, "no_helmet", 1.0, str(evidence),
+                     plate_image_path=str(plate))
+    log(db, run="b", track=2)
+
+    assert db.delete_runs(["a"]) == 1
+    assert db.run_ids() == ["b"]
+    assert not evidence.exists() and not plate.exists()
+    assert db.delete_runs([]) == 0                      # nothing selected: nothing happens
+
+
+def test_delete_runs_can_keep_the_files_and_delete_all_empties_the_log(db, tmp_path):
+    picture = tmp_path / "e.jpg"
+    picture.write_bytes(b"x")
+    db.log_violation("a", "clip.mp4", 1, "no_helmet", 1.0, str(picture))
+    log(db, run="b", track=2)
+
+    db.delete_runs(["a"], remove_files=False)
+    assert picture.exists()
+
+    assert db.delete_all() == 1
+    assert db.fetch() == [] and db.runs_overview() == []

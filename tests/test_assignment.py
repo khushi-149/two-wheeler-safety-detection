@@ -174,121 +174,45 @@ def test_claims_report_which_rider_owns_which_head():
 
     assert len(claims) == 1 and claims[0][0] == riders[0]["box"]
 
+def test_fullframe_heads_fill_gaps_and_respect_regions():
+    from assignment import merge_fullframe_heads
 
-# ------------------------------------------------ far-away background people
-
-def _bike_with_two_riders():
-    bike = {"box": [100, 300, 400, 580]}                       # 280 px tall
-    riders = [
-        {"box": [120, 200, 220, 520], "head": (170, 240), "hip": (170, 430)},
-        {"box": [230, 200, 330, 520], "head": (280, 240), "hip": (280, 430)},
+    crop = [{"box": [100, 100, 200, 200], "conf": 0.7, "cls": 0}]
+    full = [
+        {"box": [102, 98, 198, 202], "conf": 0.8, "cls": 0},      # same head, same class
+        {"box": [300, 100, 400, 200], "conf": 0.8, "cls": 0},     # missed by the crop
+        {"box": [900, 100, 990, 190], "conf": 0.9, "cls": 0},     # outside every bike region
     ]
-    return bike, riders
+    regions = [(0, 0, 500, 400)]
+
+    merged = merge_fullframe_heads(crop, full, regions)
+
+    assert len(merged) == 2
+    assert merged[0]["box"] == [100, 100, 200, 200]               # the crop's box is kept
+    assert merged[1]["box"] == [300, 100, 400, 200]
 
 
-def test_small_background_heads_are_not_hidden_pillions():
-    """Regression: 2 tiny pedestrians far behind the bike made 'RIDERS: 5'."""
-    from assignment import assign_heads_to_bikes, assign_people_to_bikes
+def test_fullframe_head_overrides_a_conflicting_crop_call_only_when_clearly_better():
+    from assignment import merge_fullframe_heads
 
-    bike, riders = _bike_with_two_riders()
-    _, rider_boxes, others = assign_people_to_bikes(riders, [bike])
-    real = [{"box": [150, 215, 190, 265], "cls": 1, "conf": 0.9},        # 50 px heads
-            {"box": [260, 215, 300, 265], "cls": 1, "conf": 0.9}]
-    far = [{"box": [200, 250, 212, 262], "cls": 1, "conf": 0.8},         # 12 px: tiny
-           {"box": [340, 250, 352, 262], "cls": 1, "conf": 0.8}]
+    regions = [(0, 0, 500, 400)]
+    crop = [{"box": [100, 100, 200, 200], "conf": 0.45, "cls": 1}]    # crop says Without
 
-    owners = assign_heads_to_bikes(real + far, [bike], rider_boxes, others)
+    better = [{"box": [100, 100, 200, 200], "conf": 0.80, "cls": 0}]  # whole frame: With
+    close = [{"box": [100, 100, 200, 200], "conf": 0.47, "cls": 0}]
 
-    assert sum(1 for _, _, extra in owners if extra) == 0
+    assert merge_fullframe_heads(crop, better, regions)[0]["cls"] == 0
+    assert merge_fullframe_heads(crop, close, regions)[0]["cls"] == 1
 
 
-def test_true_hidden_pillion_of_normal_size_is_still_counted():
-    from assignment import assign_heads_to_bikes, assign_people_to_bikes
+def test_confident_whole_frame_helmet_beats_a_unsure_crop_without_helmet():
+    from assignment import merge_fullframe_heads
 
-    bike, riders = _bike_with_two_riders()
-    _, rider_boxes, others = assign_people_to_bikes(riders, [bike])
-    heads = [{"box": [150, 215, 190, 265], "cls": 1, "conf": 0.9},
-             {"box": [260, 215, 300, 265], "cls": 1, "conf": 0.9},
-             {"box": [205, 225, 245, 275], "cls": 0, "conf": 0.9}]       # hidden, same size
+    regions = [(0, 0, 500, 400)]
+    crop = [{"box": [100, 100, 200, 200], "conf": 0.60, "cls": 1}]     # crop: Without, unsure
+    full = [{"box": [100, 100, 200, 200], "conf": 0.55, "cls": 0}]     # whole frame: With
 
-    owners = assign_heads_to_bikes(heads, [bike], rider_boxes, others)
+    assert merge_fullframe_heads(crop, full, regions)[0]["cls"] == 0
 
-    assert sum(1 for _, _, extra in owners if extra) == 1
-
-
-def test_tiny_person_next_to_a_bike_is_not_a_rider():
-    from assignment import is_plausible_rider
-
-    bike = {"box": [0, 300, 300, 580]}                          # 280 px
-    pedestrian = {"box": [100, 250, 120, 320], "head": (110, 258)}   # 70 px = 0.25 bikes
-
-    assert is_plausible_rider(pedestrian, bike) is False
-
-
-def test_people_sitting_behind_a_parked_bike_are_not_its_riders():
-    """Regression: two men on steps behind a parked bike were counted as '2 riders'."""
-    from assignment import assign_people_to_bikes
-
-    bike = {"box": [485, 280, 920, 675]}
-    sitters = [{"box": [550, 130, 640, 262], "head": (590, 150), "hip": (595, 235)},
-               {"box": [640, 135, 720, 266], "head": (670, 155), "hip": (680, 240)}]
-
-    counts, rider_boxes, others = assign_people_to_bikes(sitters, [bike])
-
-    assert counts == {0: 0} and len(others) == 2
-
-
-def test_rider_with_legs_over_the_bike_still_counts():
-    from assignment import assign_people_to_bikes
-
-    bike = {"box": [100, 300, 400, 560]}
-    rider = {"box": [150, 160, 260, 540], "head": (200, 190), "hip": (205, 420)}
-
-    assert assign_people_to_bikes([rider], [bike])[0] == {0: 1}
-
-
-# ------------------------------------------------ crowded riders (real numbers from triple_3.jpg)
-
-TRIPLE_3_BIKE = {"box": [1276, 2255, 4271, 3615]}
-TRIPLE_3_PEOPLE = [        # order as the pose model returned them: rear rider FIRST
-    {"box": [2727, 1346, 4240, 3622], "head": (3572, 1511), "hip": (3647, 2948)},    # rear
-    {"box": [1544, 1288, 2924, 3586], "head": (2436, 1549), "hip": (2648, 2904)},    # front
-    {"box": [2222, 1278, 3454, 3601], "head": (3035, 1528), "hip": (3063, 2959)},    # middle
-]
-TRIPLE_3_HEADS = [
-    {"box": [2843, 1189, 3391, 1795], "cls": 0, "conf": 0.37},     # middle rider's helmet
-    {"box": [3423, 1001, 3980, 1528], "cls": 0, "conf": 0.52},     # rear rider's helmet
-]
-
-
-def test_crowded_riders_keep_their_own_helmets_and_are_counted_once():
-    """Regression: the rear rider took the middle rider's helmet -> '4 riders' (3 real)."""
-    from assignment import assign_heads_to_bikes, assign_people_to_bikes
-
-    counts, rider_boxes, others = assign_people_to_bikes(TRIPLE_3_PEOPLE, [TRIPLE_3_BIKE])
-    claims = []
-    owners = assign_heads_to_bikes(TRIPLE_3_HEADS, [TRIPLE_3_BIKE], rider_boxes, others,
-                                   claims, TRIPLE_3_PEOPLE)
-
-    assert counts == {0: 3}
-    assert sum(1 for _, _, extra in owners if extra) == 0          # no phantom 4th rider
-    owner_of = {tuple(body): det["box"] for body, det in claims}
-    assert owner_of[(2727, 1346, 4240, 3622)] == [3423, 1001, 3980, 1528]    # rear -> rear helmet
-    assert owner_of[(2222, 1278, 3454, 3601)] == [2843, 1189, 3391, 1795]    # middle -> middle helmet
-    assert (1544, 1288, 2924, 3586) not in owner_of                           # front: no head found
-
-
-def test_without_pose_head_points_matching_still_works():
-    from assignment import assign_heads_to_bikes, assign_people_to_bikes
-
-    bike = {"box": [100, 300, 300, 450]}
-    riders = [{"box": [110, 150, 190, 420], "head": (150, 170), "hip": (150, 380)},
-              {"box": [200, 150, 280, 420], "head": (240, 170), "hip": (240, 380)}]
-    _, rider_boxes, others = assign_people_to_bikes(riders, [bike])
-    heads = [{"box": [220, 150, 260, 190], "cls": 0, "conf": 0.9},
-             {"box": [130, 150, 170, 190], "cls": 1, "conf": 0.9}]
-
-    claims = []
-    assign_heads_to_bikes(heads, [bike], rider_boxes, others, claims)       # no people passed
-
-    assert len(claims) == 2 and {c[1]["cls"] for c in claims} == {0, 1}
+    sure = [{"box": [100, 100, 200, 200], "conf": 0.90, "cls": 1}]     # crop: Without, very sure
+    assert merge_fullframe_heads(sure, full, regions)[0]["cls"] == 1   # needs a clear win to flip

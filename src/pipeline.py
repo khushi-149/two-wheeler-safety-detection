@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from datetime import datetime
 
@@ -29,16 +30,23 @@ from assignment import (
     bike_region,
     dedupe_detections,
     hip_from_keypoints,
+    dedupe_nested_bikes,
+    drop_headless_people,
+    merge_fullframe_heads,
     match_no_helmet_to_motorcycle,
+    merge_duplicate_people,
+    merge_nested_heads,
     person_seat_point,
     smoothed_count,
+    unresolved_rider_heads,
 )
 from capture import IMAGE_EXTENSIONS, ImageCapture, ThreadedCapture
-from geometry import iou
-from head_check import UNKNOWN_HEAD, head_crop_detections, verify_decision
-from display import OverlayDisplay
-from drawing import (AMBER, BLUE, DARK, DARK_RED, GREEN, RED, WHITE, LabelPlacer,
-                     Style)
+from geometry import iou, point_in_box
+from head_check import (
+    head_crop_detections, skin_fraction, verify_decision, verify_with_decision,
+)
+from drawing import (BLUE, GREEN, RED, WHITE, Style, draw_label, draw_tag,
+                     draw_warning, make_header)
 from plate_reader import AsyncPlateReader, PlateReader, PlateTracker
 from rider_association import (
     head_point,
@@ -48,11 +56,26 @@ from rider_association import (
     detect_triple_riding,
     head_from_keypoints,
 )
-from rider_tracking import MotorcycleTracker
+from rider_tracking import MotorcycleTracker, PhotoMotorcycleDetector
 from settings import model_path, resolve_path
 from violation_db import ViolationDB
 
 log = logging.getLogger(__name__)
+
+def _grow(box, fraction):
+    """``box`` enlarged by ``fraction`` of its size on every side."""
+    dx, dy = (box[2] - box[0]) * fraction, (box[3] - box[1]) * fraction
+    return [box[0] - dx, box[1] - dy, box[2] + dx, box[3] + dy]
+
+
+def _relative(box, anchor):
+    """``box`` expressed relative to ``anchor`` (a bike's top-left corner)."""
+    return [box[0] - anchor[0], box[1] - anchor[1],
+            box[2] - anchor[0], box[3] - anchor[1]]
+
+
+# class id of the neutral "helmet unknown" marker (not a detector class)
+UNKNOWN_HELMET = -1
 
 try:
     import torch
@@ -148,7 +171,10 @@ class ViolationPipeline:
 
         self.plate_reader = None
         self.photo_mode = False      # set by run(): photos use a larger analysis size
-        self._photo_pose = None      # stronger pose model, loaded on first photo
+        self._photo_traffic = None   # photo motorcycle model, loaded on first photo
+        self.last_debug = {}         # raw detections of the last analysis (for explain_photo)
+        self.debug_refine = False    # explain_photo turns this on to log the re-checks
+        self.refine_log = []
 
         log.info("Compute device: %s", "GPU (CUDA)" if USE_GPU else "CPU only")
 
@@ -192,29 +218,13 @@ class ViolationPipeline:
             "head": head_from_keypoints(keypoints, confidences),
             "hip": hip_from_keypoints(keypoints, confidences),
             "conf": float(box.conf[0]),
+            # how many of nose / left eye / right eye the pose model sees clearly
+            "face": sum(
+                1 for k in (0, 1, 2)
+                if confidences is not None and k < len(confidences)
+                and confidences[k] >= 0.5
+            ),
         }
-
-    def _helmet_conf(self):
-        """Photos are analysed once, so they can afford a lower (more sensitive) threshold."""
-        if self.photo_mode:
-            return min(cfg.HELMET_CONF, cfg.PHOTO_HELMET_CONF)
-
-        return cfg.HELMET_CONF
-
-    def _active_pose(self):
-        """Photos use the stronger pose model (better with hidden pillions); videos stay fast."""
-        if not self.photo_mode or not cfg.POSE_MODEL_PHOTO:
-            return self.pose_model
-
-        if self._photo_pose is None:
-            try:
-                self._photo_pose = YOLO(model_path(cfg.POSE_MODEL_PHOTO))
-            except Exception as error:      # offline / download failed: keep going
-                log.warning("Could not load %s (%s); using the standard pose model.",
-                            cfg.POSE_MODEL_PHOTO, error)
-                self._photo_pose = self.pose_model
-
-        return self._photo_pose
 
     def _detect_people(self, frame):
         """Original method: pose on the whole frame."""
@@ -231,7 +241,7 @@ class ViolationPipeline:
         return dedupe_people(people)
 
     def _detect_helmets_fullframe(self, frame):
-        result = self.helmet_model(frame, conf=self._helmet_conf(), verbose=False)[0]
+        result = self.helmet_model(frame, conf=cfg.HELMET_CONF, verbose=False)[0]
 
         return [
             {
@@ -249,7 +259,7 @@ class ViolationPipeline:
         """
         h, w = frame.shape[:2]
 
-        crops, offsets = [], []
+        crops, offsets, regions = [], [], []
 
         for moto in motorcycles:
             rx1, ry1, rx2, ry2 = bike_region(moto["box"], w, h)
@@ -259,6 +269,7 @@ class ViolationPipeline:
 
             crops.append(frame[ry1:ry2, rx1:rx2])
             offsets.append((rx1, ry1))
+            regions.append((rx1, ry1, rx2, ry2))
 
         if not crops:
             return [], []
@@ -267,7 +278,7 @@ class ViolationPipeline:
 
         imgsz = self._crop_imgsz(crops)
 
-        pose_results = self._active_pose()(
+        pose_results = self.pose_model(
             crops, conf=cfg.POSE_CONF, imgsz=imgsz, half=USE_GPU, verbose=False
         )
 
@@ -283,7 +294,7 @@ class ViolationPipeline:
                     )
 
         helmet_results = self.helmet_model(
-            crops, conf=self._helmet_conf(), imgsz=imgsz, half=USE_GPU, verbose=False
+            crops, conf=cfg.HELMET_CONF, imgsz=imgsz, half=USE_GPU, verbose=False
         )
 
         for result, (ox, oy) in zip(helmet_results, offsets):
@@ -295,10 +306,41 @@ class ViolationPipeline:
                     "cls": int(b.cls[0]),
                 })
 
+        if cfg.FULLFRAME_HELMET_PASS and not (
+                cfg.FULLFRAME_ONLY_IF_HEAD_MISSING
+                and len(helmets) >= len(people)
+                and not any(h["cls"] == self.no_helmet_class for h in helmets)):
+            helmets = merge_fullframe_heads(
+                helmets, self._fullframe_heads(frame), regions,
+                cfg.FULLFRAME_MIN_GAIN, with_cls=self.helmet_class)
+
+        # kept for scripts/explain_photo.py (what the models saw before filtering)
+        self.last_debug = {"raw_people": list(people), "raw_helmets": list(helmets)}
+
         people = dedupe_detections(dedupe_people(people), cfg.PERSON_DUP_IOU)
-        return people, dedupe_detections(helmets)
+        # one rider reported twice must not become a second rider
+        people = merge_duplicate_people(people)
+        helmets = merge_nested_heads(dedupe_detections(helmets))
+        # pieces of body (no head anywhere) are not riders
+        people = drop_headless_people(people, helmets)
+        return people, helmets
 
     # ---------------------------------------------------------------
+
+    def _fullframe_heads(self, frame):
+        """Helmet model on the whole frame: a second opinion for the crop pass."""
+        result = self.helmet_model(
+            frame, conf=cfg.HELMET_CONF, imgsz=cfg.FULLFRAME_IMGSZ,
+            half=USE_GPU, verbose=False)[0]
+
+        if result.boxes is None:
+            return []
+
+        return [
+            {"box": b.xyxy[0].cpu().tolist(), "conf": float(b.conf[0]),
+             "cls": int(b.cls[0])}
+            for b in result.boxes
+        ]
 
     def _crop_imgsz(self, crops):
         """
@@ -315,21 +357,72 @@ class ViolationPipeline:
 
         return max(cfg.CROP_IMGSZ, min(size, cfg.CROP_IMGSZ_MAX))
 
-    def _recovery_imgsz(self):
-        return cfg.RECOVERY_IMGSZ_PHOTO if self.photo_mode else cfg.RECOVERY_IMGSZ
+    def _note(self, kind, bike, det, look, verdict):
+        """Record one re-check for scripts/explain_photo.py (only when debugging)."""
+        if not self.debug_refine:
+            return
+
+        self.refine_log.append({
+            "kind": kind, "bike": bike,
+            "orig": (det["cls"], det["conf"]) if det is not None else None,
+            "look": [(d["cls"], round(d["conf"], 2)) for d in look],
+            "verdict": (verdict["cls"], round(verdict["conf"], 2)) if verdict else None,
+        })
+
+    def _recheck(self, frame, person, det, bike_index, kind):
+        """
+        Zoomed second look at one detected head. Returns the replacement
+        detection, or None to keep ``det``:
+          "With Helmet" below VERIFY_BELOW   -> "Without" if the zoom clearly says so
+          "Without Helmet" below VERIFY_NO_BELOW -> "With" if the zoom clearly says so
+        """
+        if not cfg.VERIFY_ENABLED:
+            return None
+
+        if det["cls"] == self.helmet_class and det["conf"] < cfg.VERIFY_BELOW:
+            check = verify_decision
+            limit = cfg.VERIFY_WITHOUT_MIN
+        elif det["cls"] == self.no_helmet_class and det["conf"] < cfg.VERIFY_NO_BELOW:
+            check = verify_with_decision
+            limit = cfg.VERIFY_WITH_MIN
+        else:
+            self._note(kind + " (not re-checked: sure enough)", bike_index, det, [], None)
+            return None
+
+        look = head_crop_detections(
+            self.helmet_model, frame, person,
+            cfg.RECOVERY_CONF, cfg.RECOVERY_IMGSZ, around=det["box"])
+        verdict = check(look, self.helmet_class, self.no_helmet_class, limit)
+
+        if verdict is None and det["cls"] == self.helmet_class and cfg.WEAK_WITH_BELOW:
+            zoomed_with = max((d["conf"] for d in look if d["cls"] == self.helmet_class),
+                              default=0.0)
+
+            if max(det["conf"], zoomed_with) < cfg.WEAK_WITH_BELOW:
+                # nothing confirms the "helmet": a cap, hair or a small child
+                verdict = {"box": det["box"], "cls": self.no_helmet_class,
+                           "conf": det["conf"]}
+
+        self._note(kind, bike_index, det, look, verdict)
+
+        return verdict
 
     def _refine_heads(self, frame, people, rider_boxes, owners, claims, due):
         """
         Second look at each rider's head on a zoomed crop (see head_check.py):
-          * a rider with NO head yet -> try to recover one (or, if
-            INFER_NO_HELMET, report "no helmet");
-          * a doubtful "With Helmet" -> override it when the zoomed crop
-            clearly says "Without Helmet".
+          * a rider with NO head yet -> try to recover one (or report "no
+            helmet" if INFER_NO_HELMET, or if the face is clearly visible and
+            INFER_NO_HELMET_IF_FACE);
+          * a doubtful head is re-checked and flipped when the zoomed crop
+            clearly disagrees (see ``_recheck``).
         Only bikes analysed this frame (``due``) are refined.
         """
         person_by_box = {tuple(p["box"]): p for p in people}
         claim_by_body = {tuple(body): det for body, det in claims}
         owners = list(owners)
+
+        def replace(det, verdict):
+            return [(verdict, o[1], o[2]) if o[0] is det else o for o in owners]
 
         for bike_index in due:
             for body in rider_boxes.get(bike_index, []):
@@ -340,49 +433,158 @@ class ViolationPipeline:
 
                 det = claim_by_body.get(tuple(body))
 
-                if det is None:
-                    found = head_crop_detections(
-                        self.helmet_model, frame, person,
-                        cfg.RECOVERY_CONF, self._recovery_imgsz())
-
-                    if found:
-                        best = max(found, key=lambda d: d["conf"])
-
-                        # not the same head as one already counted
-                        if all(iou(best["box"], o[0]["box"]) < 0.5 for o in owners):
-                            owners.append((best, bike_index, False))
-                    elif cfg.INFER_NO_HELMET or self.photo_mode:
-                        hx, hy = head_point(person)
-                        r = max((body[2] - body[0]) * 0.20, (body[3] - body[1]) * 0.07, 10)
-
-                        # INFER_NO_HELMET on  -> a real "no helmet" violation.
-                        # Otherwise (photos)  -> an amber "HELMET NOT FOUND" marker
-                        # for a human to check; it is NOT counted as a violation.
-                        owners.append((
-                            {"box": [hx - r, hy - r, hx + r, hy + r],
-                             "cls": (self.no_helmet_class if cfg.INFER_NO_HELMET
-                                     else UNKNOWN_HEAD),
-                             "conf": 0.0},
-                            bike_index, False))
-
-                elif (cfg.VERIFY_ENABLED
-                        and det["cls"] == self.helmet_class
-                        and det["conf"] < cfg.VERIFY_BELOW):
-                    verdict = verify_decision(
-                        head_crop_detections(
-                            self.helmet_model, frame, person,
-                            cfg.RECOVERY_CONF, self._recovery_imgsz()),
-                        self.helmet_class, self.no_helmet_class,
-                        cfg.VERIFY_WITHOUT_MIN)
+                if det is not None:
+                    verdict = self._recheck(frame, person, det, bike_index, "rider's head")
 
                     if verdict is not None:
-                        owners = [(verdict, o[1], o[2]) if o[0] is det else o
-                                  for o in owners]
+                        owners = replace(det, verdict)
+
+                    continue
+
+                # Its head point is already inside a head we have: this "person"
+                # is the same rider reported twice (or a piece of one), not a
+                # rider without a helmet. Never invent a violation for it.
+                hp = head_point(person)
+
+                if any(point_in_box(hp, _grow(o[0]["box"], 0.15)) for o in owners):
+                    self._note("skipped: head already counted", bike_index, None, [], None)
+                    continue
+
+                found = head_crop_detections(
+                    self.helmet_model, frame, person,
+                    cfg.RECOVERY_CONF, cfg.RECOVERY_IMGSZ)
+                self._note("rider with no head (recovery look)", bike_index, None, found, None)
+
+                if found:
+                    best = max(found, key=lambda d: d["conf"])
+
+                    # not the same head as one already counted
+                    if all(iou(best["box"], o[0]["box"]) < 0.5 for o in owners):
+                        owners.append((best, bike_index, False))
+                elif cfg.INFER_NO_HELMET or (
+                        cfg.INFER_NO_HELMET_IF_FACE and person.get("face", 0) >= 2):
+                    hx, hy = head_point(person)
+                    r = max((body[2] - body[0]) * 0.20, (body[3] - body[1]) * 0.07, 10)
+                    guess = [hx - r, hy - r, hx + r, hy + r]
+
+                    # a guess needs a bare head: skin-coloured pixels, not a
+                    # dark helmet (INFER_NO_HELMET=True skips this check)
+                    if (cfg.INFER_NO_HELMET
+                            or skin_fraction(frame, guess) >= cfg.SKIN_MIN_FRACTION):
+                        owners.append((
+                            {"box": guess, "cls": self.no_helmet_class,
+                             "conf": 0.0},
+                            bike_index, False))
+                    else:
+                        self._note("guess dropped: no skin in head box",
+                                   bike_index, None, [], None)
+
+        # Heads with no body of their own (a pillion the pose model missed) get
+        # the same second look.
+        for det, owner, extra in list(owners):
+            if extra and owner in due:
+                verdict = self._recheck(
+                    frame, {"box": list(det["box"]), "head": None}, det, owner,
+                    "hidden pillion's head")
+
+                if verdict is not None:
+                    owners = replace(det, verdict)
 
         return owners
 
+    def _judge_heads(self, heads, anchor, previous_tracks, needed, unresolved_is_no,
+                     frame_size=None):
+        """
+        Per-head verdict with memory. Each head is followed from analysis to
+        analysis (matched by position relative to its bike). It is shown as
+        "no helmet" only when ``needed`` of its own last NO_HELMET_WINDOW
+        checks said so; once confirmed it stays until NO_HELMET_STICKY "with
+        helmet" checks in a row. Changes each head's ``cls`` in place and
+        returns the updated tracks.
+        """
+        tracks, used = [], set()
+
+        for head in heads:
+            rel = _relative(head["box"], anchor)
+            cx, cy = (rel[0] + rel[2]) / 2, (rel[1] + rel[3]) / 2
+            best, best_dist = None, float("inf")
+
+            for k, old in enumerate(previous_tracks):
+                if k in used:
+                    continue
+
+                ox, oy = (old["rel"][0] + old["rel"][2]) / 2, (old["rel"][1] + old["rel"][3]) / 2
+                same = (iou(rel, old["rel"]) >= 0.3
+                        or point_in_box((cx, cy), old["rel"])
+                        or point_in_box((ox, oy), rel))
+                dist = (cx - ox) ** 2 + (cy - oy) ** 2
+
+                if same and dist < best_dist:
+                    best, best_dist = k, dist
+
+            if best is None and len(heads) == 1 and len(previous_tracks) == 1 \
+                    and not used:
+                best = 0        # the bike's only head moved/jittered: still the same head
+
+            if best is None:
+                track = {"votes": [], "run": 0, "confirmed": False}
+            else:
+                used.add(best)
+                track = dict(previous_tracks[best])
+
+            cls = head["cls"]
+            bare_unknown = (cls == UNKNOWN_HELMET
+                            and head.get("skin", 1.0) >= cfg.SKIN_MIN_FRACTION)
+            says_no = cls == self.no_helmet_class or (unresolved_is_no and bare_unknown)
+
+            # A head cut off by the frame border cannot be judged reliably
+            # (a dark helmet half out of view looks like bare hair): it is never
+            # a violation, only "helmet unknown".
+            if frame_size and says_no:
+                hx1, hy1, hx2, hy2 = head["box"]
+                m = 0.01 * frame_size[0]
+                if hx1 <= m or hy1 <= m or hx2 >= frame_size[0] - m:
+                    track["rel"] = rel
+                    track["votes"] = (track["votes"] + [False])[-cfg.NO_HELMET_WINDOW:]
+                    if not track["confirmed"]:
+                        head["cls"] = UNKNOWN_HELMET
+                        tracks.append(track)
+                        continue
+                    says_no = False
+
+            track["rel"] = rel
+            track["votes"] = (track["votes"] + [says_no])[-cfg.NO_HELMET_WINDOW:]
+
+            if says_no:
+                track["run"] = 0
+            elif cls == self.helmet_class:
+                track["run"] += 1
+
+            if not track["confirmed"] and sum(track["votes"]) >= needed:
+                track["confirmed"], track["run"] = True, 0
+
+            if track["confirmed"] and not says_no and track["run"] >= cfg.NO_HELMET_STICKY:
+                track["confirmed"], track["votes"] = False, []      # cleared
+
+            if track["confirmed"]:
+                head["cls"] = self.no_helmet_class
+            elif says_no:
+                # not enough agreeing checks yet: if this head was already seen
+                # wearing a helmet (or has history) show that, not a flicker;
+                # a brand-new head shows the neutral marker
+                steady = len(track["votes"]) >= needed or not all(track["votes"])
+                head["cls"] = self.helmet_class if steady else UNKNOWN_HELMET
+
+            tracks.append(track)
+
+        return tracks
+
     def _analyze_cached(self, frame, motorcycles, cache, frame_count,
-                        min_history_for_triple=cfg.MIN_HISTORY_FOR_TRIPLE):
+                        min_history_for_triple=cfg.MIN_HISTORY_FOR_TRIPLE,
+                        no_helmet_votes=cfg.NO_HELMET_VOTES,
+                        unresolved_is_no=False,
+                        analyze_every=cfg.ANALYZE_EVERY,
+                        refine_every=1):
         """
         Staggered rider/helmet analysis.
 
@@ -396,7 +598,7 @@ class ViolationPipeline:
         due = [
             i for i, m in enumerate(motorcycles)
             if m["track_id"] not in cache
-            or (m["track_id"] + frame_count) % cfg.ANALYZE_EVERY == 0
+            or (m["track_id"] + frame_count) % analyze_every == 0
         ]
 
         people = []
@@ -414,10 +616,21 @@ class ViolationPipeline:
             )
             claims = []
             owners = assign_heads_to_bikes(
-                helmet_dets, motorcycles, rider_boxes, other_boxes, claims, people
+                helmet_dets, motorcycles, rider_boxes, other_boxes, claims,
+                people=people,
             )
+            # Zoomed second look: always for new or doubtful bikes; a bike whose
+            # last analysis was clean only every REFINE_EVERY-th time (speed).
+            refine_due = [
+                i for i in due
+                if motorcycles[i]["track_id"] not in cache
+                or refine_every <= 1
+                or cache[motorcycles[i]["track_id"]].get("n", 0) % refine_every == 0
+                or any(cache[motorcycles[i]["track_id"]].get("votes", [])[-1:])
+                or any(cache[motorcycles[i]["track_id"]].get("unknown", [])[-1:])
+            ]
             owners = self._refine_heads(
-                frame, people, rider_boxes, owners, claims, due
+                frame, people, rider_boxes, owners, claims, refine_due
             )
 
             for i in due:
@@ -429,16 +642,64 @@ class ViolationPipeline:
                     for det, owner_i, extra in owners if owner_i == i
                 ]
 
+                # Riders whose head the model never found get a neutral
+                # "helmet unknown" marker (never a violation, never counted).
+                for box in unresolved_rider_heads(
+                        rider_boxes.get(i, []), people,
+                        [h["box"] for h in heads]):
+                    heads.append({"box": box, "cls": UNKNOWN_HELMET, "extra": False,
+                                  "skin": skin_fraction(frame, box)})
+
+                # A "head" marker that swallows another head is a ghost person
+                # (e.g. trees): drop it, keep the real, smaller one.
+                heads = [
+                    h for h in heads
+                    if not (h["cls"] == UNKNOWN_HELMET and any(
+                        o is not h and point_in_box(
+                            ((o["box"][0] + o["box"][2]) / 2,
+                             (o["box"][1] + o["box"][3]) / 2), h["box"])
+                        and (o["box"][2] - o["box"][0]) < 0.7 * (h["box"][2] - h["box"][0])
+                        for o in heads))
+                ]
+
                 raw = counts[i] + sum(1 for h in heads if h["extra"])
 
                 previous = cache.get(track_id)
                 history = (previous["history"] if previous else []) + [raw]
                 history = history[-cfg.COUNT_HISTORY:]
 
+                # Each head is judged on its OWN history (see _judge_heads), so one
+                # rider's confirmed violation never turns a neighbour red.
+                anchor = (bike["box"][0], bike["box"][1])
+                fh, fw = frame.shape[:2]
+                margin = 0.01 * fw
+                bx = bike["box"]
+                # a bike entering/leaving the frame is only visible for a few
+                # analyses, so it may confirm one vote sooner
+                bike_edge = (bx[0] <= margin or bx[2] >= fw - margin
+                             or bx[3] >= fh - margin)
+                needed = max(2, no_helmet_votes - 1) if bike_edge else no_helmet_votes
+                tracks = self._judge_heads(
+                    heads, anchor, previous.get("tracks", []) if previous else [],
+                    needed, unresolved_is_no, (fw, fh))
+
+                # bike-level flags, used only to decide how often to re-check
+                said_no = any(
+                    t["votes"][-1:] == [True] for t in tracks)
+                votes = ((previous["votes"] if previous else []) + [said_no])
+                votes = votes[-cfg.NO_HELMET_WINDOW:]
+                unknown_votes = ((previous.get("unknown", []) if previous else [])
+                                 + [any(h["cls"] == UNKNOWN_HELMET for h in heads)]
+                                 )[-cfg.NO_HELMET_WINDOW:]
+
                 cache[track_id] = {
                     "anchor": (bike["box"][0], bike["box"][1]),
                     "count": smoothed_count(history, min_history_for_triple),
                     "history": history,
+                    "votes": votes,
+                    "n": (previous.get("n", 0) if previous else 0) + 1,
+                    "unknown": unknown_votes,
+                    "tracks": tracks,
                     "heads": heads,
                     "seen": frame_count,
                 }
@@ -457,9 +718,11 @@ class ViolationPipeline:
 
             for head in entry["heads"]:
                 b = head["box"]
+                cls = head["cls"]
+
                 head_owners.append((
                     {"box": [b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy],
-                     "cls": head["cls"], "conf": 1.0},
+                     "cls": cls, "conf": 1.0},
                     i,
                     head["extra"],
                 ))
@@ -473,10 +736,15 @@ class ViolationPipeline:
     def run(self, source, show_window=False,
             frame_callback=None, callback_every=2, should_stop=None,
             live=False, save_video=True, pace_to_fps=True,
-            realtime=False, display_callback=None):
+            realtime=False, display_callback=None, smooth_overlay=False,
+            frame_stride=1):
         """
         Process a video file, or a live camera/stream when `source` is a
         camera index (int) or `live=True`. Returns a summary dict.
+
+        frame_stride  (video files, not real-time) analyse only every Nth
+                      frame: 3 is about three times faster and still tracks
+                      bikes fine.
 
         live        read the newest frame only (no lag), use wall-clock time
         save_video  write the annotated output video
@@ -484,7 +752,12 @@ class ViolationPipeline:
                     (never faster) so playback looks smooth
         realtime    play a video FILE at its real speed and let detection skip
                     frames to keep up (like a live camera)
-        display_callback(frame_bgr)  if given, a separate thread calls it with
+        smooth_overlay  False (default): display_callback receives each frame
+                    WITH its own boxes, so boxes always sit on the right
+                    object (the picture updates at the detector speed).
+                    True: the picture plays at full speed and the latest boxes
+                    are pasted on top; on a moving bike the boxes lag behind.
+        display_callback(frame_bgr)  if given, (with smooth_overlay) a separate thread calls it with
                     the video at full speed (about source fps), drawing the
                     latest detections on top. Detection speed no longer limits
                     how smooth the video looks; the boxes update as fast as
@@ -532,7 +805,16 @@ class ViolationPipeline:
             cap.release()
             raise RuntimeError("Invalid video dimensions.")
 
-        style = Style(width, height)
+        # shrink very large video (4K) once, up front: much faster, same accuracy
+        shrink = 1.0
+
+        if (not is_image and cfg.VIDEO_MAX_SIDE
+                and max(width, height) > cfg.VIDEO_MAX_SIDE):
+            shrink = cfg.VIDEO_MAX_SIDE / max(width, height)
+            width = int(width * shrink) // 2 * 2
+            height = int(height * shrink) // 2 * 2
+
+        style = Style(height, width)
 
         if live:
             video_name = f"camera_{source}" if isinstance(source, int) else "stream"
@@ -544,6 +826,10 @@ class ViolationPipeline:
 
         output_video_path = os.path.join(self.video_folder, f"tracked_{run_id}.mp4")
 
+        # only a plain file read can skip frames cheaply (grab = decode only)
+        stride = (max(1, int(frame_stride))
+                  if not (live or paced_file or is_image) else 1)
+
         writer = None
 
         if save_video and not is_image and not paced_file:
@@ -551,7 +837,7 @@ class ViolationPipeline:
             # modest fixed rate instead of the camera's nominal fps.
             writer = cv2.VideoWriter(
                 output_video_path, cv2.VideoWriter_fourcc(*"mp4v"),
-                15 if live else fps, (width, height),
+                15 if live else fps / stride, (width, height),
             )
 
             if not writer.isOpened():
@@ -560,8 +846,21 @@ class ViolationPipeline:
 
         # Fresh detector + tracker per run so track IDs never carry over
         # from a previous video.
-        traffic_model = YOLO(self.traffic_path)
-        tracker = MotorcycleTracker(traffic_model, confidence=cfg.MOTORCYCLE_CONF)
+        traffic_model = None if is_image else YOLO(self.traffic_path)
+        if is_image:
+            # a photo has no motion to track: retry harder before giving up.
+            # The (large) photo model is loaded once and kept, so a batch of
+            # photos does not reload it every time.
+            if self._photo_traffic is None:
+                self._photo_traffic = YOLO(model_path(cfg.PHOTO_TRAFFIC_MODEL))
+
+            tracker = PhotoMotorcycleDetector(
+                self._photo_traffic, confidence=cfg.MOTORCYCLE_CONF
+            )
+        else:
+            tracker = MotorcycleTracker(
+                traffic_model, confidence=cfg.MOTORCYCLE_CONF
+            )
         plate_tracker = PlateTracker()
 
         # One background worker per run (closed again at the end)
@@ -570,6 +869,7 @@ class ViolationPipeline:
             if self.plate_reader is not None else None
         )
 
+        source_index = 0
         frame_count = 0
         evidence_count = 0
         annotated = None
@@ -610,7 +910,8 @@ class ViolationPipeline:
         def make_stats():
             return {
                 "run_id": run_id,
-                "frame": cap.frame_index if paced_file else frame_count,
+                "frame": cap.frame_index if paced_file else source_index,
+                "frames_analysed": frame_count,
                 "total_frames": total_frames,
                 "detector_fps": frame_count / max(1e-6, time.perf_counter() - t_start),
                 "motorcycles": len(seen_ids),
@@ -621,23 +922,89 @@ class ViolationPipeline:
             }
 
         # ---------- Smooth display, decoupled from detection ----------
-        display = None
+        display_thread = None
+        display_stop = threading.Event()
+        overlay = {"data": None}
+        last_push = {"t": time.perf_counter()}
+        overlay_lock = threading.Lock()
 
         disp_w = min(width, 960)
         disp_h = max(1, int(height * disp_w / width))
 
-        if display_callback is not None and realtime:
-            display = OverlayDisplay(
-                cap, display_callback, (disp_w, disp_h), fps,
-                aligned=paced_file and cfg.ALIGNED_FILE_DISPLAY,
-                min_delay=cfg.DISPLAY_MIN_DELAY, max_delay=cfg.DISPLAY_MAX_DELAY,
-            )
+        if display_callback is not None and realtime and smooth_overlay:
+
+            def display_loop():
+                last_seq = -1
+
+                while not display_stop.is_set():
+                    frame_now, seq = cap.peek()
+
+                    if frame_now is None or seq == last_seq:
+                        time.sleep(0.004)
+                        continue
+
+                    last_seq = seq
+
+                    try:
+                        small = cv2.resize(frame_now, (disp_w, disp_h),
+                                           interpolation=cv2.INTER_AREA)
+
+                        with overlay_lock:
+                            data = overlay["data"]
+
+                        if data is not None:
+                            mask, pixels = data
+                            np.copyto(small, pixels, where=mask)
+
+                        display_callback(small)
+                    except Exception as error:  # never let display kill the run
+                        log.warning("Display error: %s", error)
+                        time.sleep(0.05)
+
+            display_thread = threading.Thread(target=display_loop, daemon=True)
+
+        elif display_callback is not None and realtime:
+            # Boxes are drawn on the frame they were computed on, so the picture
+            # only changes as fast as detection runs. On a slow computer the
+            # first result can take many seconds: until then (and whenever the
+            # detector falls behind) show the plain video so the screen is
+            # never blank, then switch back to the boxed pictures.
+            def keepalive_loop():
+                last_seq = -1
+
+                while not display_stop.is_set():
+                    time.sleep(0.04)
+
+                    if time.perf_counter() - last_push["t"] < 0.8:
+                        continue
+
+                    frame_now, seq = cap.peek()
+
+                    if frame_now is None or seq == last_seq:
+                        continue
+
+                    last_seq = seq
+
+                    try:
+                        small = cv2.resize(frame_now, (disp_w, disp_h),
+                                           interpolation=cv2.INTER_AREA)
+                        cv2.putText(small, "Analysing...", (10, 28),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                                    (0, 0, 0), 4, cv2.LINE_AA)
+                        cv2.putText(small, "Analysing...", (10, 28),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                                    (0, 255, 255), 2, cv2.LINE_AA)
+                        display_callback(small)
+                    except Exception as error:
+                        log.warning("Display error: %s", error)
+
+            display_thread = threading.Thread(target=keepalive_loop, daemon=True)
 
         if paced_file:
             cap.start()          # the file starts playing now, models are loaded
 
-        if display is not None:
-            display.start()
+        if display_thread is not None:
+            display_thread.start()
 
         try:
             while True:
@@ -645,28 +1012,49 @@ class ViolationPipeline:
                 if should_stop is not None and should_stop():
                     break
 
+                for _ in range(stride - 1):
+                    if cap.grab():
+                        source_index += 1
+
                 ret, frame = cap.read()
 
                 if not ret:
                     break
 
-                t_frame_read = time.perf_counter()
-                frame_seq = getattr(cap, "last_read_seq", 0)
+                if shrink < 1.0:
+                    frame = cv2.resize(frame, (width, height),
+                                       interpolation=cv2.INTER_AREA)
+
                 frame_count += 1
+                source_index += 1
+
+                if frame_count == 1 and display_callback is not None and not is_image:
+                    # show the video at once; the first analysis takes a while
+                    try:
+                        first = cv2.resize(frame, (disp_w, disp_h),
+                                           interpolation=cv2.INTER_AREA)
+                        for colour, thick in (((0, 0, 0), 4), ((0, 255, 255), 2)):
+                            cv2.putText(first, "Analysing...", (10, 28),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                                        colour, thick, cv2.LINE_AA)
+                        display_callback(first)
+                    except Exception as error:
+                        log.warning("Display error: %s", error)
+
                 if live:
                     video_time = time.perf_counter() - t_start
                 elif paced_file:
                     video_time = cap.frame_index / fps
                 else:
-                    video_time = frame_count / fps
+                    video_time = source_index / fps
 
                 # ---------- Motorcycle tracking ----------
                 t0 = time.perf_counter()
 
-                motorcycles = [
+                motorcycles = dedupe_nested_bikes([
                     {"box": m["box"], "conf": m["conf"], "track_id": m["track_id"]}
                     for m in tracker.update(frame)
-                ]
+                ])
 
                 t_track += time.perf_counter() - t0
 
@@ -688,6 +1076,18 @@ class ViolationPipeline:
                         min_history_for_triple=(
                             1 if is_image else cfg.MIN_HISTORY_FOR_TRIPLE
                         ),
+                        no_helmet_votes=1 if is_image else cfg.NO_HELMET_VOTES,
+                        # frames are already skipped (stride / real-time): check
+                        # every frame we do process, so the checks stay as close
+                        # together in VIDEO time as with no skipping
+                        analyze_every=(
+                            1 if (live or paced_file)
+                            else max(1, cfg.ANALYZE_EVERY // stride)
+                        ),
+                        refine_every=1 if is_image else cfg.REFINE_EVERY,
+                        unresolved_is_no=(
+                            not is_image
+                            and cfg.UNRESOLVED_HEAD_IS_NO_HELMET_IN_VIDEO),
                     )
                     helmet_dets = []
                     riding_status = detect_triple_riding(rider_counts)
@@ -705,7 +1105,18 @@ class ViolationPipeline:
                 t_analyze += time.perf_counter() - t0
 
                 annotated = frame.copy()
-                placer = LabelPlacer(annotated.shape, style)
+
+                # Rectangles already used by labels on this frame, so labels
+                # never sit on top of each other. The top-left corner is kept
+                # free for the warning banners.
+                banner_w, _ = cv2.getTextSize(
+                    "TRIPLE RIDING DETECTED", cv2.FONT_HERSHEY_SIMPLEX,
+                    style.warning_scale, style.warning_thickness)[0]
+                banner_w = min(width, banner_w + 2 * style.pad + 20)
+                # (a photo gets a header strip above the picture instead)
+                placed = [] if is_image else [
+                    (0, 0, banner_w,
+                     style.warning_start + style.warning_line + style.pad)]
 
                 if cfg.DEBUG_DRAW_PEOPLE:
                     for person in people:
@@ -730,12 +1141,13 @@ class ViolationPipeline:
                         if idx is not None:
                             head_owners.append((det, idx, False))
 
+                # Faces are kept clear: no label may be drawn over a head.
+                head_rects = [tuple(int(v) for v in det["box"])
+                              for det, _idx, _extra in head_owners]
+                placed.extend(head_rects)
+
                 # Only heads that belong to a rider are drawn / counted;
                 # pedestrians' heads are ignored.
-                # Keep label chips off every head box
-                for det, _idx, _extra in head_owners:
-                    placer.taken.append(tuple(int(v) for v in det["box"]))
-
                 for det, idx, _is_extra in head_owners:
 
                     coords = det["box"]
@@ -747,20 +1159,22 @@ class ViolationPipeline:
 
                         cv2.rectangle(annotated, (hx1, hy1), (hx2, hy2),
                                       RED, style.box)
-                        placer.draw(annotated, "NO HELMET", hx1, hy1,
-                                    anchor="above", bg=DARK_RED,
-                                    scale=style.tag_scale)
+                        # tag stuck to ITS head (all other heads stay clear)
+                        draw_tag(annotated, style, "NO HELMET",
+                                 (hx1, hy1, hx2, hy2), WHITE, bg=(0, 0, 180),
+                                 placed=placed)
 
                     elif det["cls"] == self.helmet_class:
                         cv2.rectangle(annotated, (hx1, hy1), (hx2, hy2),
                                       (0, 200, 0), style.thin)
 
-                    elif det["cls"] == UNKNOWN_HEAD:
+                    elif det["cls"] == UNKNOWN_HELMET:
+                        # head not found by the model: neutral yellow marker
                         cv2.rectangle(annotated, (hx1, hy1), (hx2, hy2),
-                                      AMBER, style.thin)
-                        placer.draw(annotated, "HELMET NOT FOUND", hx1, hy1,
-                                    anchor="above", color=DARK, bg=AMBER,
-                                    scale=style.tag_scale)
+                                      (0, 215, 255), style.thin)
+                        draw_tag(annotated, style, "HELMET?",
+                                 (hx1, hy1, hx2, hy2), (0, 0, 0),
+                                 bg=(0, 215, 255), placed=placed)
 
                 # ---------- Finished background plate reads ----------
                 collect_plate_results()
@@ -791,8 +1205,9 @@ class ViolationPipeline:
 
                     # ----- Number plate (only for violators) -----
                     is_violator = track_id in helmet_ids or track_id in triple_ids
+                    wants_plate = is_violator or (is_image and cfg.READ_PLATES_IN_PHOTOS)
 
-                    if (plate_worker is not None and is_violator
+                    if (plate_worker is not None and wants_plate
                             and not plate_worker.is_pending(track_id)
                             and plate_tracker.should_try(track_id, 0 if is_image else frame_count)):
 
@@ -819,35 +1234,57 @@ class ViolationPipeline:
 
                     cv2.rectangle(annotated, (x1, y1), (x2, y2), color, style.box)
 
-                    plural = "rider" if count == 1 else "riders"
-                    lines = [(f"#{track_id}  {count} {plural}", WHITE,
-                              DARK_RED if violating else DARK)]
+                    if cfg.COMPACT_LABELS and not violating:
+                        label = f"#{track_id} R:{count}"
+                        scale = style.label_scale * 0.8
+                    else:
+                        # two short lines instead of one very long one
+                        label = f"ID {track_id} | RIDERS: {count}"
+                        problems = []
 
-                    if is_triple:
-                        lines.append(("TRIPLE RIDING", WHITE, DARK_RED))
+                        if is_triple:
+                            problems.append("TRIPLE RIDING")
 
-                    if has_no_helmet:
-                        lines.append(("NO HELMET", WHITE, DARK_RED))
+                        if has_no_helmet:
+                            problems.append("NO HELMET")
+
+                        if problems:
+                            label += "\n" + " | ".join(problems)
+
+                        scale = None
 
                     if best_plate:
-                        lines.append((f"PLATE {best_plate['text']}", DARK, (0, 220, 255)))
+                        label += f"\nPLATE: {best_plate['text']}"
 
-                    # Labels go BELOW the bike (over the road), not above it where
-                    # they would cover the riders' heads.
-                    placer.stack(annotated, lines, x1, y2, anchor="below")
+                    # tucked inside the bike box, bottom-left (clear of faces)
+                    draw_label(annotated, style, label, x1 + 4, y2 - 4,
+                               font_scale=scale, placed=placed, anchor="bottom")
 
-                # ---------- Warning banners (small, top-left) ----------
-                banner = []
+                # ---------- Warning banners ----------
+                warning_y = style.warning_start
 
-                if no_helmet_by_moto:
-                    banner.append(("NO HELMET VIOLATION", WHITE, DARK_RED))
+                if is_image:
+                    banners = []
 
-                if any_triple:
-                    banner.append(("TRIPLE RIDING DETECTED", WHITE, DARK_RED))
+                    if no_helmet_by_moto:
+                        banners.append("NO HELMET VIOLATION")
 
-                if banner:
-                    placer.stack(annotated, banner, style.gap, 0, anchor="below",
-                                 scale=style.warning_scale)
+                    if any_triple:
+                        banners.append("TRIPLE RIDING DETECTED")
+
+                    header = make_header(width, style, banners)
+
+                    if header is not None:
+                        annotated = np.vstack([header, annotated])
+                else:
+                    if no_helmet_by_moto:
+                        draw_warning(annotated, style, "NO HELMET VIOLATION",
+                                     warning_y)
+                        warning_y += style.warning_line
+
+                    if any_triple:
+                        draw_warning(annotated, style, "TRIPLE RIDING DETECTED",
+                                     warning_y)
 
                 # ---------- Evidence + database ----------
                 due = [
@@ -897,7 +1334,7 @@ class ViolationPipeline:
                         1000 * t_analyze / frame_count,
                     )
 
-                if display is not None:
+                if display_thread is not None and smooth_overlay:
                     changed = np.any(annotated != frame, axis=2).astype(np.uint8)
                     small_mask = cv2.resize(
                         changed, (disp_w, disp_h), interpolation=cv2.INTER_AREA
@@ -906,9 +1343,18 @@ class ViolationPipeline:
                         annotated, (disp_w, disp_h), interpolation=cv2.INTER_AREA
                     )
 
-                    display.push_overlay(
-                        frame_seq, small_mask[:, :, None], small_pixels)
-                    display.report_latency(time.perf_counter() - t_frame_read)
+                    with overlay_lock:
+                        overlay["data"] = (small_mask[:, :, None], small_pixels)
+
+                elif display_callback is not None:
+                    # boxes and picture come from the SAME frame: always aligned
+                    try:
+                        display_callback(cv2.resize(
+                            annotated, (disp_w, disp_h),
+                            interpolation=cv2.INTER_AREA))
+                        last_push["t"] = time.perf_counter()
+                    except Exception as error:  # never let display kill the run
+                        log.warning("Display error: %s", error)
 
                 if writer is not None:
                     writer.write(annotated)
@@ -945,8 +1391,10 @@ class ViolationPipeline:
                             time.sleep(wait)
 
         finally:
-            if display is not None:
-                display.stop()
+            display_stop.set()
+
+            if display_thread is not None and display_thread.is_alive():
+                display_thread.join(timeout=1.0)
 
             cap.release()
 
